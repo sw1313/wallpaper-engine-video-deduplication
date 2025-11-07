@@ -6,6 +6,7 @@ wallpaper engine视频筛重，取消订阅重复视频
 步骤2：`config.toml`中`workshop_root` 填入wallpaper engine的创意工坊目录  
 步骤3：安装环境：`pip install imagehash pillow pandas openpyxl tqdm numpy`  
 步骤4：执行：`python we_duplicate_finder_readonly.py -c config.toml`，执行完成生成的文件在脚本子目录`output`文件夹内  
-步骤5：在默认浏览器中登录steam账号  
+步骤5：在默认浏览器中登录steam账号 
+步骤6：在浏览器中安装tampermonkey等脚本插件，导入`wallpaper-engine-video-deduplication.js`文件
 步骤6：进入output目录，在路径下执行：`python bulk_unsub_controller.py --xlsx xxx.xlsx --batch-size 1`  
 其中`xxx.xlsx`为执行：`python we_duplicate_finder_readonly.py -c config.toml`最后在`output`文件夹生成的xlsx文件名称  
