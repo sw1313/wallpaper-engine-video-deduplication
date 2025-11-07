@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         Steam Workshop 取消订阅·固定池轮转（强门控｜UI-only｜GM_xmlhttpRequest）
+// @name         Steam Workshop 取消订阅·固定池轮转（强门控+错误页跳过｜UI-only｜GM_xmlhttpRequest）
 // @namespace    local.bulk-unsub
-// @version      14.3.0
-// @description  仅当 URL 含 #bulk_unsub=1：先检测18+门→过门→待订阅UI出现后仅用UI退订/判定未订阅→捕获DOM或网络成功信号再回参→当前标签跳到下一条；绝不点“订阅”。
+// @version      14.4.0
+// @description  仅当 URL 含 #bulk_unsub=1：先判“错误/被删”→立刻跳过；否则先过18+门→待订阅UI出现后仅用UI退订/判定未订阅→捕获DOM或网络成功信号再回参→当前标签跳到下一条；绝不点“订阅”。
 // @match        https://steamcommunity.com/sharedfiles/filedetails/*
 // @run-at       document-end
 // @grant        GM_xmlhttpRequest
@@ -39,76 +39,6 @@
     return byLabel || all[all.length-1];
   }
 
-  // —— 强化 18+ 门检测 —— //
-  function findGateBtn(){
-    // 常见绿色/蓝色按钮、以及“继续/查看/我已满18岁/continue/view item/view content”
-    const wanted = ['查看物品','查看该物品','继续浏览','继续','我已年满18岁','confirm','view item','view content','continue','enter'];
-    const sel = [
-      'a.btn_blue_steamui','button.btn_blue_steamui','.btn_blue_steamui a',
-      'a.btn_green_steamui','button.btn_green_steamui','.btn_green_steamui a',
-      'input[type="submit"]','button[type="submit"]'
-    ].join(',');
-    // 也兼容经典 agegate 表单
-    let btn = Array.from(D.querySelectorAll(sel)).find(el=>{
-      if (!isVis(el)) return false;
-      const t = norm(txt(el));
-      return t && wanted.some(w=> t.includes(norm(w)));
-    });
-    if (btn) return btn;
-    // 极端：整页只有遮罩上的“继续”链接
-    btn = Array.from(D.querySelectorAll('a,button')).find(el=>{
-      if (!isVis(el)) return false;
-      const t = norm(txt(el));
-      return t && wanted.some(w=> t.includes(norm(w)));
-    });
-    return btn || null;
-  }
-  function isGateScreen(){
-    // 若订阅 UI 已出现则不是门
-    if (getAdd() || getToggle()) return false;
-    // 有明显年龄表单/提示
-    if (D.querySelector('#agegate_box, .agegate_birthday_selector, #app_agegate')) return true;
-    // 有“继续/查看”按钮但还没订阅 UI
-    if (findGateBtn()) return true;
-    return false;
-  }
-  function click(el){
-    try{
-      const r = el.getBoundingClientRect();
-      const cx = Math.floor(r.left + r.width/2), cy = Math.floor(r.top + r.height/2);
-      const common={bubbles:true,cancelable:true,clientX:cx,clientY:cy,button:0,buttons:1,detail:1};
-      const p={...common, pointerId:1, isPrimary:true};
-      el.dispatchEvent(new PointerEvent('pointermove',p));
-      el.dispatchEvent(new PointerEvent('pointerdown',p));
-      el.dispatchEvent(new MouseEvent('mousedown',common));
-      el.dispatchEvent(new MouseEvent('mouseup',{...common,buttons:0}));
-      el.dispatchEvent(new MouseEvent('click',{...common,buttons:0}));
-      el.dispatchEvent(new PointerEvent('pointerup',{...p,buttons:0}));
-    }catch(e){ try{ el.click(); }catch(_){} }
-  }
-
-  // —— 只在确认“过门且订阅UI已现”后，才进入后续逻辑 —— //
-  function ensureGatePassed(onReady){
-    // 1) 已经有订阅 UI => 直接 ready
-    if (getAdd() || getToggle()) { onReady(); return; }
-
-    // 2) 装观察器：门出现→点门；订阅 UI 出现→ready
-    const mo = new MutationObserver(()=>{
-      if (getAdd() || getToggle()) { try{mo.disconnect();}catch(_){ } onReady(); return; }
-      const g = findGateBtn();
-      if (g) click(g);
-      // 有些门会把 #… 换掉，确保保留触发 hash
-      if (/^#(changenotes|comments|discussions)/i.test(location.hash)) {
-        history.replaceState(null,'', location.href.replace(/#.*$/,'') + '#bulk_unsub=1');
-      }
-    });
-    mo.observe(D.documentElement || D.body, {childList:true, subtree:true});
-
-    // 3) 初始就有门按钮的话先点一次
-    const g0 = findGateBtn();
-    if (g0) click(g0);
-  }
-
   // —— 只上报一次 —— //
   const goNext = (()=> {
     let sent=false;
@@ -130,13 +60,92 @@
           let data={}; try{ data=JSON.parse(res.responseText||'{}'); }catch(_){}
           const next = data && data.url;
           if (next) location.assign(next);
-        },
-        onerror: function(){ /* 后端挂了就留在此页 */ }
+        }
       });
     };
   })();
 
-  // —— 退订成功的两个信号：Add 出现 或 /unsubscribe 200 —— //
+  // —— 错误/被删页检测（标题或正文关键字） —— //
+  function isErrorOrGonePage(){
+    const title = (document.title || '').toLowerCase();
+    if (/错误|error/.test(title)) return true;
+
+    const bodyText = ((D.body && D.body.innerText) || '').toLowerCase();
+    const hit = [
+      '未找到', '不存在', '已被删除', '已被移除', '无法使用', '无效的物品', '您请求的项目',
+      'not found', 'no longer available', 'has been removed', 'was removed', 'invalid item'
+    ].some(w => bodyText.includes(w));
+    if (hit) return true;
+
+    // 常见错误容器
+    if (D.querySelector('.error_ctn, .error, #error_box, .pagecontent .error')) return true;
+
+    // 保险：既不是门也看不到任何订阅 UI，且正文很短/全是错误提示
+    if (!(getAdd() || getToggle())) {
+      const len = bodyText.length;
+      if (len>0 && len<200 && /error|错误|not\s*found|removed/i.test(bodyText)) return true;
+    }
+    return false;
+  }
+
+  // —— 强化 18+ 门检测/通过 —— //
+  function findGateBtn(){
+    const wanted = ['查看物品','查看该物品','继续浏览','继续','我已年满18岁','confirm','view item','view content','continue','enter'];
+    const sel = [
+      'a.btn_blue_steamui','button.btn_blue_steamui','.btn_blue_steamui a',
+      'a.btn_green_steamui','button.btn_green_steamui','.btn_green_steamui a',
+      'input[type="submit"]','button[type="submit"]'
+    ].join(',');
+    let btn = Array.from(D.querySelectorAll(sel)).find(el=>{
+      if (!isVis(el)) return false;
+      const t = norm(txt(el));
+      return t && wanted.some(w=> t.includes(norm(w)));
+    });
+    if (btn) return btn;
+    btn = Array.from(D.querySelectorAll('a,button')).find(el=>{
+      if (!isVis(el)) return false;
+      const t = norm(txt(el));
+      return t && wanted.some(w=> t.includes(norm(w)));
+    });
+    return btn || null;
+  }
+  function click(el){
+    try{
+      const r=el.getBoundingClientRect();
+      const cx=Math.floor(r.left+r.width/2), cy=Math.floor(r.top+r.height/2);
+      const common={bubbles:true,cancelable:true,clientX:cx,clientY:cy,button:0,buttons:1,detail:1};
+      const p={...common, pointerId:1, isPrimary:true};
+      el.dispatchEvent(new PointerEvent('pointermove',p));
+      el.dispatchEvent(new PointerEvent('pointerdown',p));
+      el.dispatchEvent(new MouseEvent('mousedown',common));
+      el.dispatchEvent(new MouseEvent('mouseup',{...common,buttons:0}));
+      el.dispatchEvent(new MouseEvent('click',{...common,buttons:0}));
+      el.dispatchEvent(new PointerEvent('pointerup',{...p,buttons:0}));
+    }catch(e){ try{ el.click(); }catch(_){} }
+  }
+  function ensureGatePassed(onReady){
+    // 先看是否是被删/错误页：直接跳过
+    if (isErrorOrGonePage()) { goNext('gone'); return; }
+
+    // 订阅 UI 已在：继续
+    if (getAdd() || getToggle()) { onReady(); return; }
+
+    // 装观察器：门→点；UI→ready；若异步变成错误页→直接跳过
+    const mo = new MutationObserver(()=>{
+      if (isErrorOrGonePage()) { try{mo.disconnect();}catch(_){ } goNext('gone'); return; }
+      if (getAdd() || getToggle()) { try{mo.disconnect();}catch(_){ } onReady(); return; }
+      const g = findGateBtn(); if (g) click(g);
+      if (/^#(changenotes|comments|discussions)/i.test(location.hash)) {
+        history.replaceState(null,'', location.href.replace(/#.*$/,'') + '#bulk_unsub=1');
+      }
+    });
+    mo.observe(D.documentElement || D.body, {childList:true, subtree:true});
+
+    // 初始若就有门按钮：点一次
+    const g0 = findGateBtn(); if (g0) click(g0);
+  }
+
+  // —— 网络/DOM 成功信号 —— //
   (function netProbe(){
     if (window.__bulk_unsub_net_patched) return; window.__bulk_unsub_net_patched = true;
     const of = window.fetch?.bind(window);
@@ -185,14 +194,12 @@
     return window.name;
   }
 
-  // —— 主流程（严格门控 + 事件驱动）—— //
+  // —— 主流程 —— //
   ensureGatePassed(function onUIReady(){
-    // A) 未订阅：直接回参要下一条
+    // A) 未订阅：直接回参
     if (getAdd()) { goNext('already'); return; }
 
-    // B) 已订阅：优先点“取消订阅”，否则把主按钮当开关；成功信号由 watch/netProbe 捕捉
-    //    注意：这里不做任何 sleep
-    // 打开一次菜单（悬停 + 轻点）
+    // B) 已订阅：只点“取消订阅”，否则主按钮开关；成功信号由 watch/netProbe 捕捉
     (function openMenuOnce(){
       const t = getToggle(); if (!t) return;
       try{
@@ -214,17 +221,17 @@
     if (rm){
       click(rm);
       const anc = rm.closest('a,button,[role="button"]'); if (anc && anc!==rm) click(anc);
-      watchAddThenFinish('ui_unsub');  // DOM 成功信号
+      watchAddThenFinish('ui_unsub');
       return;
     }
     const t = getToggle();
     if (t){
-      click(t);                        // 主按钮开关
-      watchAddThenFinish('ui_toggle'); // DOM 成功信号
+      click(t);
+      watchAddThenFinish('ui_toggle');
       return;
     }
 
-    // C) 极少数 UI 迟到：再观察一次，一旦出现 Add 就收尾
+    // C) 若 UI 迟到：继续观察；但若异步变成错误页，也会被 ensureGatePassed 的观察器捕捉到并 gone
     const mo = new MutationObserver(()=>{
       if (getAdd()){ try{mo.disconnect();}catch(_){ } goNext('already'); }
     });
