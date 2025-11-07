@@ -1,0 +1,34 @@
+# 你的创意工坊目录（本地或 UNC）
+workshop_root = "E:\\SteamLibrary\\steamapps\\workshop\\content\\431960"
+
+# 输出目录
+output_dir = "output"
+
+# 外部工具（在 PATH 可直接用则不改）
+ffmpeg_path  = "ffmpeg"
+ffprobe_path = "ffprobe"
+fpcalc_path  = "fpcalc"
+
+# —— 中段取样设置 ——
+video_window_seconds = 20
+audio_window_seconds = 120
+seek_ratio = 0.5
+
+# pHash / 指纹
+sample_frames = 12
+phash_size    = 8
+
+# 时长分桶
+duration_rounding = "nearest_0.3"          # 或 "nearest_0.5"
+require_both_signatures = false     # 音频经常缺失可改为 false（只看视觉）
+
+# —— 并行与超时 ——
+max_workers_stage1 = 8             # 阶段1：并行测时长
+max_workers_stage2 = 6             # 阶段2：并行签名
+ffprobe_timeout = 25
+ffmpeg_timeout  = 45
+fpcalc_timeout  = 35
+
+# —— 日志 / UI ——
+log_file = "we_duplicate.log"
+progress = true                    # 如果想默认关闭进度条改为 false
