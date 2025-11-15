@@ -239,6 +239,7 @@ def ffmpeg_extract_small_gray_frames_middle(ffmpeg_path: str, video: Path, frame
     def run_and_collect(vf: str, limit: int, start_s: float, win_s: float) -> List[np.ndarray]:
         cmd = [
             ffmpeg_path, "-hide_banner", "-v", "error", "-nostdin",
+            "-hwaccel", "auto",  # ★ 新增：使用 GPU（若可用，自动回退到 CPU）
             "-ss", f"{start_s:.3f}",
             "-t",  f"{win_s:.3f}",
             "-i",  str(video),
