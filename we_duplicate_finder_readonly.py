@@ -4,11 +4,11 @@
 """
 Wallpaper Engine (431960) 重复视频检测
 - 严格只读（恢复 atime/mtime）
-- 两阶段并行：先“时长分桶”，再对候选桶并行做 pHash + 音频指纹
+- 两阶段逻辑保留，但通过管线并行把“时长分桶”和“签名”重叠执行
 - 中段取样（避免片头片尾黑屏）
 - 临时缓存“匹完就删”（TemporaryDirectory 作用域内清理）
 - 导出 CSV/XLSX：每组一行，组内链接按该条目命中的最大文件大小降序
-- 进度条：阶段1/阶段2均显示（tqdm）
+- 进度条：整体仍有 S1/S2 两个 tqdm
 
 用法：
   python we_duplicate_finder_readonly.py -c config.toml --verbose --trace
@@ -34,6 +34,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from threading import Lock
 
 try:
     import tomllib  # py311+
@@ -143,10 +144,9 @@ def preserve_times(p: Path):
 
 def run_cmd(cmd: List[str], timeout: int, trace=False) -> Tuple[int, bytes, bytes, float]:
     """运行外部命令，返回 (rc, stdout, stderr, 耗时秒)。"""
-    import shlex as _shlex
     t0 = time.time()
     if trace:
-        LOGGER.info("[exec] %s (timeout=%ss)", " ".join(_shlex.quote(c) for c in cmd), timeout)
+        LOGGER.info("[exec] %s (timeout=%ss)", " ".join(shlex.quote(c) for c in cmd), timeout)
     try:
         flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
         res = subprocess.run(
@@ -162,7 +162,7 @@ def run_cmd(cmd: List[str], timeout: int, trace=False) -> Tuple[int, bytes, byte
     except subprocess.TimeoutExpired as e:
         el = time.time() - t0
         if trace:
-            LOGGER.error("[exec] TIMEOUT after %.2fs: %s", el, " ".join(_shlex.quote(c) for c in cmd))
+            LOGGER.error("[exec] TIMEOUT after %.2fs: %s", el, " ".join(shlex.quote(c) for c in cmd))
         return 124, b"", str(e).encode("utf-8", "ignore"), el
     except Exception as e:
         el = time.time() - t0
@@ -239,7 +239,7 @@ def ffmpeg_extract_small_gray_frames_middle(ffmpeg_path: str, video: Path, frame
     def run_and_collect(vf: str, limit: int, start_s: float, win_s: float) -> List[np.ndarray]:
         cmd = [
             ffmpeg_path, "-hide_banner", "-v", "error", "-nostdin",
-            "-hwaccel", "auto",  # ★ 新增：使用 GPU（若可用，自动回退到 CPU）
+            "-hwaccel", "auto",  # GPU 可用时用硬解码，不可用时自动退回 CPU
             "-ss", f"{start_s:.3f}",
             "-t",  f"{win_s:.3f}",
             "-i",  str(video),
@@ -337,6 +337,7 @@ def fpcalc_fingerprint_middle(fpcalc_path: str, ffmpeg_path: str, video: Path,
         wav_path = Path(tdir) / (uuid.uuid4().hex + ".wav")  # 文件尚不存在
         cmd_ff = [
             ffmpeg_path, "-hide_banner", "-v", "error", "-nostdin",
+            "-hwaccel", "auto",  # 同样尝试硬解码
             "-ss", f"{start:.3f}",
             "-t",  f"{win:.3f}",
             "-i",  str(video),
@@ -373,7 +374,7 @@ def find_items(workshop_root: Path) -> Dict[str, List[Path]]:
                     items[item_id].append(Path(root) / fn)
     return items
 
-# ----------------------------- 阶段1：并行测时长 & 分桶（带进度条） -----------------------------
+# ----------------------------- 阶段1：测时长（保留旧实现，当前主流程不直接使用） -----------------------------
 
 def measure_duration_one(item_id: str, vp: Path, cfg: Config) -> DurationRec:
     url = make_we_url(item_id)
@@ -388,7 +389,7 @@ def measure_duration_one(item_id: str, vp: Path, cfg: Config) -> DurationRec:
     return DurationRec(item_id=item_id, path=vp, size=size, duration=dur, bucket=bucket, url=url)
 
 def stage1_measure_and_bucket(items_map: Dict[str, List[Path]], cfg: Config) -> Dict[str, List[DurationRec]]:
-    """并行测时长 → 按分桶聚合，只保留候选桶（≥2个不同 item）。"""
+    """旧版：先把所有时长算完再返回候选桶（主流程现改为管线式，仅保留以备需要）"""
     total_files = sum(len(v) for v in items_map.values())
     LOGGER.info("[S1] 开始：并行测时长（max_workers=%d，files=%d）", cfg.max_workers_stage1, total_files)
     bucket_map: Dict[str, List[DurationRec]] = defaultdict(list)
@@ -398,7 +399,8 @@ def stage1_measure_and_bucket(items_map: Dict[str, List[Path]], cfg: Config) -> 
             for vp in paths:
                 futures.append(ex.submit(measure_duration_one, item_id, vp, cfg))
 
-        pb = tqdm(total=len(futures), desc="[S1] durations", unit="file", dynamic_ncols=True, disable=not cfg.progress)
+        pb = tqdm(total=len(futures), desc="[S1] durations", unit="file",
+                  dynamic_ncols=True, disable=not cfg.progress)
         try:
             for fut in as_completed(futures):
                 rec = None
@@ -412,7 +414,6 @@ def stage1_measure_and_bucket(items_map: Dict[str, List[Path]], cfg: Config) -> 
         finally:
             pb.close()
 
-    # 只保留候选桶：至少来自两个不同 item（能产生重复的可能）
     candidate_buckets: Dict[str, List[DurationRec]] = {}
     for b, lst in bucket_map.items():
         item_ids = {r.item_id for r in lst}
@@ -422,7 +423,7 @@ def stage1_measure_and_bucket(items_map: Dict[str, List[Path]], cfg: Config) -> 
     LOGGER.info("[S1] 完成：总桶=%d，候选桶=%d（进入阶段2）", len(bucket_map), len(candidate_buckets))
     return candidate_buckets
 
-# ----------------------------- 阶段2：并行取样与签名（带进度条，仅候选桶） -----------------------------
+# ----------------------------- 阶段2：签名（函数保留，主流程会在管线模式下调用） -----------------------------
 
 def sign_one(rec: DurationRec, cfg: Config) -> FileSig:
     """对单文件计算 pHash +（可选）音频指纹（均在中段窗口）。"""
@@ -475,7 +476,7 @@ def sign_one(rec: DurationRec, cfg: Config) -> FileSig:
     return fs
 
 def stage2_sign_candidates(candidate_buckets: Dict[str, List[DurationRec]], cfg: Config) -> List[FileSig]:
-    """并行对候选桶内所有文件计算签名（pHash + 音频）。"""
+    """旧版：拿到完整候选桶后再统一并行签名（主流程现改为管线式，仅保留以备需要）"""
     total_candidates = sum(len(v) for v in candidate_buckets.values())
     LOGGER.info("[S2] 开始：候选桶签名（max_workers=%d，files=%d）", cfg.max_workers_stage2, total_candidates)
     filesigs: List[FileSig] = []
@@ -485,7 +486,8 @@ def stage2_sign_candidates(candidate_buckets: Dict[str, List[DurationRec]], cfg:
             for rec in recs:
                 futures.append(ex.submit(sign_one, rec, cfg))
 
-        pb = tqdm(total=len(futures), desc="[S2] signatures", unit="file", dynamic_ncols=True, disable=not cfg.progress)
+        pb = tqdm(total=len(futures), desc="[S2] signatures", unit="file",
+                  dynamic_ncols=True, disable=not cfg.progress)
         try:
             for fut in as_completed(futures):
                 try:
@@ -498,6 +500,89 @@ def stage2_sign_candidates(candidate_buckets: Dict[str, List[DurationRec]], cfg:
             pb.close()
 
     LOGGER.info("[S2] 完成：已计算签名文件数=%d", len(filesigs))
+    return filesigs
+
+# ----------------------------- 新：阶段1+阶段2 管线并行 -----------------------------
+
+def stage1_and_stage2_pipelined(items_map: Dict[str, List[Path]], cfg: Config) -> List[FileSig]:
+    """
+    管线式执行：
+      - 线程池 A：测时长 + 分桶
+      - 线程池 B：一旦某个桶变成候选桶，就立刻对该桶内文件提交签名任务
+      - 这样 ffprobe / ffmpeg / fpcalc 可以同时跑，多核 / GPU 利用率更高
+    """
+    total_files = sum(len(v) for v in items_map.values())
+    LOGGER.info("[PIPE] 开始：阶段1+阶段2 管线并行（dur_workers=%d, sig_workers=%d, files=%d）",
+                cfg.max_workers_stage1, cfg.max_workers_stage2, total_files)
+
+    bucket_map: Dict[str, List[DurationRec]] = defaultdict(list)
+    bucket_items: Dict[str, set] = defaultdict(set)
+    candidate_buckets: set = set()
+    sig_futures = []
+    filesigs: List[FileSig] = []
+    lock = Lock()
+
+    with ThreadPoolExecutor(max_workers=cfg.max_workers_stage1) as ex_dur, \
+         ThreadPoolExecutor(max_workers=cfg.max_workers_stage2) as ex_sig:
+
+        # 提交所有“测时长”任务
+        dur_futs = []
+        for item_id, paths in items_map.items():
+            for vp in paths:
+                dur_futs.append(ex_dur.submit(measure_duration_one, item_id, vp, cfg))
+
+        pb1 = tqdm(total=len(dur_futs), desc="[S1] durations", unit="file",
+                   dynamic_ncols=True, disable=not cfg.progress)
+        try:
+            for fut in as_completed(dur_futs):
+                rec = None
+                try:
+                    rec = fut.result()
+                except Exception as e:
+                    LOGGER.exception("[PIPE-S1] 任务异常：%s", e)
+
+                if rec and rec.duration is not None and rec.bucket is not None:
+                    to_sign: List[DurationRec] = []
+                    # 更新桶信息 & 判断是否成为候选桶
+                    with lock:
+                        bucket_map[rec.bucket].append(rec)
+                        items = bucket_items[rec.bucket]
+                        if rec.item_id not in items:
+                            items.add(rec.item_id)
+                        if rec.bucket not in candidate_buckets:
+                            # 第一次成为候选桶：这个桶里所有已有文件都要签名
+                            if len(bucket_map[rec.bucket]) >= 2 and len(items) >= 2:
+                                candidate_buckets.add(rec.bucket)
+                                to_sign = list(bucket_map[rec.bucket])
+                        else:
+                            # 已经是候选桶了，新文件直接签名
+                            to_sign = [rec]
+
+                    # 在锁外提交签名任务，避免阻塞其他时长任务
+                    for r2 in to_sign:
+                        sig_futures.append(ex_sig.submit(sign_one, r2, cfg))
+
+                pb1.update(1)
+        finally:
+            pb1.close()
+
+        LOGGER.info("[PIPE] 阶段1结束，候选桶=%d，已触发签名任务=%d", len(candidate_buckets), len(sig_futures))
+
+        # 等待所有签名任务完成（此时阶段2可能已经完成了一部分）
+        pb2 = tqdm(total=len(sig_futures), desc="[S2] signatures", unit="file",
+                   dynamic_ncols=True, disable=not cfg.progress)
+        try:
+            for sf in as_completed(sig_futures):
+                try:
+                    fs = sf.result()
+                    filesigs.append(fs)
+                except Exception as e:
+                    LOGGER.exception("[PIPE-S2] 签名任务异常：%s", e)
+                pb2.update(1)
+        finally:
+            pb2.close()
+
+    LOGGER.info("[PIPE] 完成：签名文件数=%d", len(filesigs))
     return filesigs
 
 # ----------------------------- 导出 -----------------------------
@@ -565,7 +650,9 @@ def load_config(path: Optional[Path]) -> Config:
     )
 
 def main():
-    ap = argparse.ArgumentParser(description="Wallpaper Engine 重复视频检测（两阶段并行 + 中段取样 + 进度条）")
+    ap = argparse.ArgumentParser(
+        description="Wallpaper Engine 重复视频检测（管线并行：时长分桶 + 中段取样签名 + 进度条）"
+    )
     ap.add_argument("-c", "--config", type=Path, default=None, help="config.toml")
     ap.add_argument("--verbose", action="store_true", help="DEBUG 级别日志")
     ap.add_argument("--trace", action="store_true", help="打印外部命令与耗时/首行错误")
@@ -588,16 +675,8 @@ def main():
     items_map = find_items(root)
     LOGGER.info("[INFO] Found %d items with candidate video files", len(items_map))
 
-    # 阶段1：并行测时长 & 分桶（进度条）
-    candidate_buckets = stage1_measure_and_bucket(items_map, cfg)
-
-    if not candidate_buckets:
-        LOGGER.info("[INFO] 没有候选时长分桶（>=2个不同条目），直接结束")
-        LOGGER.info("[DONE] 任务完成（无重复候选）")
-        return
-
-    # 阶段2：仅对候选桶并行计算签名（进度条）
-    filesigs = stage2_sign_candidates(candidate_buckets, cfg)
+    # 新主流程：阶段1 + 阶段2 管线并行
+    filesigs = stage1_and_stage2_pipelined(items_map, cfg)
 
     # 过滤可参与最终分组的文件
     eligible: List[FileSig] = []
@@ -612,7 +691,8 @@ def main():
 
     # 最终分组键：时长分桶 + 视觉 +（可选）音频
     def gkey(fs: FileSig):
-        return (fs.duration_bucket, fs.phash_digest, fs.audio_fp_digest if cfg.require_both_signatures else None)
+        return (fs.duration_bucket, fs.phash_digest,
+                fs.audio_fp_digest if cfg.require_both_signatures else None)
 
     groups_map: Dict[Tuple[str, str, Optional[str]], List[FileSig]] = defaultdict(list)
     for fs in eligible:
@@ -634,7 +714,8 @@ def main():
         urls = [item_to_url[iid] for iid, _ in ordered]
         duplicate_groups_urls.append(urls)
         kept_groups += 1
-        LOGGER.info("[dup] 组 %s 大小=%d → %s", key, len(urls), [u.rsplit('=',1)[-1] for u in urls])
+        LOGGER.info("[dup] 组 %s 大小=%d → %s", key, len(urls),
+                    [u.rsplit('=',1)[-1] for u in urls])
 
     # 导出
     ts = time.strftime("%Y%m%d_%H%M%S")
