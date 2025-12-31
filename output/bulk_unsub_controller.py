@@ -17,11 +17,12 @@ APP_RE = re.compile(r'/app/(\d+)\b', re.IGNORECASE)
 
 # ========== 简单队列 ==========
 class UrlQueue:
-    def __init__(self, urls: List[str]):
+    def __init__(self, urls: List[str], single_page_mode: bool = False):
         self.lock = threading.Lock()
         self.urls = deque(urls)
         self.assigned = 0
         self.done = 0
+        self.single_page_mode = single_page_mode
     def pop(self) -> str:
         with self.lock:
             if not self.urls: return ""
@@ -39,17 +40,49 @@ QUEUE: UrlQueue|None = None
 # ========== 回调服务（CORS） ==========
 def _cors(h):
     h.send_header("Access-Control-Allow-Origin", "*")
-    h.send_header("Access-Control-Allow-Methods", "POST, OPTIONS")
+    h.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
     h.send_header("Access-Control-Allow-Headers", "content-type")
     h.send_header("Access-Control-Max-Age", "86400")
 
 class Handler(BaseHTTPRequestHandler):
     def do_OPTIONS(self):
-        if self.path.rstrip('/') != "/next":
+        path = self.path.rstrip('/')
+        if path not in ["/next", "/batch", "/stats"]:
             self.send_response(404); _cors(self); self.end_headers(); return
         self.send_response(204); _cors(self); self.end_headers()
+    
+    def do_GET(self):
+        path = self.path.rstrip('/')
+        # 获取统计信息
+        if path == "/stats":
+            stats = QUEUE.stats() if QUEUE else {"left": 0, "assigned": 0, "done": 0}
+            self.send_response(200); _cors(self)
+            self.send_header("Content-Type","application/json"); self.end_headers()
+            self.wfile.write(json.dumps(stats).encode('utf-8'))
+            return
+        # 批量获取 ID（用于单页面模式）
+        elif path.startswith("/batch"):
+            # 解析批次大小
+            query = parse_qs(urlparse(self.path).query)
+            size = int(query.get('size', ['10'])[0])
+            ids = []
+            if QUEUE and QUEUE.single_page_mode:
+                for _ in range(size):
+                    url = QUEUE.pop()
+                    if not url: break
+                    wid = extract_workshop_id(url)
+                    if wid: ids.append(wid)
+            print(f"[BATCH] 返回 {len(ids)} 个 workshop ID")
+            self.send_response(200); _cors(self)
+            self.send_header("Content-Type","application/json"); self.end_headers()
+            self.wfile.write(json.dumps({"ids": ids}).encode('utf-8'))
+            return
+        else:
+            self.send_response(404); _cors(self); self.end_headers()
+    
     def do_POST(self):
-        if self.path.rstrip('/') != "/next":
+        path = self.path.rstrip('/')
+        if path != "/next":
             self.send_response(404); _cors(self); self.end_headers(); return
         length = int(self.headers.get('Content-Length','0') or 0)
         raw = self.rfile.read(length) if length else b'{}'
@@ -62,10 +95,20 @@ class Handler(BaseHTTPRequestHandler):
         status = (data.get('status') or '')
         url    = (data.get('url') or '')
         if QUEUE: QUEUE.mark_done()
+        
         nxt = QUEUE.pop() if QUEUE else ""
-        print(f"[NEXT] slot={slot} id={wid} status={status} -> {'ASSIGN ' + nxt if nxt else 'EMPTY'}")
-        self.send_response(200); _cors(self); self.send_header("Content-Type","application/json"); self.end_headers()
-        self.wfile.write(json.dumps({"url": nxt}).encode('utf-8'))
+        
+        # 单页面模式：返回 workshop ID 而不是完整 URL
+        if QUEUE and QUEUE.single_page_mode and nxt:
+            nxt_id = extract_workshop_id(nxt)
+            print(f"[NEXT] slot={slot} id={wid} status={status} -> {'ASSIGN ID ' + nxt_id if nxt_id else 'EMPTY'}")
+            self.send_response(200); _cors(self); self.send_header("Content-Type","application/json"); self.end_headers()
+            self.wfile.write(json.dumps({"id": nxt_id, "url": ""}).encode('utf-8'))
+        else:
+            # 多页面模式：返回完整 URL（兼容原有逻辑）
+            print(f"[NEXT] slot={slot} id={wid} status={status} -> {'ASSIGN ' + nxt if nxt else 'EMPTY'}")
+            self.send_response(200); _cors(self); self.send_header("Content-Type","application/json"); self.end_headers()
+            self.wfile.write(json.dumps({"url": nxt}).encode('utf-8'))
 
 def start_server(port: int):
     srv = ThreadingHTTPServer(("127.0.0.1", port), Handler)
@@ -149,11 +192,15 @@ def extract_workshop_id(url: str) -> str:
 
 # ========== 主程序 ==========
 def main():
+    global QUEUE
+    
     ap = argparse.ArgumentParser(description="Steam Workshop 批量取消订阅 控制器（固定池轮转，标签自拉取下一条）")
     ap.add_argument("--xlsx", type=Path, required=True)
     ap.add_argument("--batch-size", type=int, default=10, help="初始打开的标签数（固定池大小）")
     ap.add_argument("--add-appid", action="store_true", help="为每个链接补充 ?appid=XXXX")
     ap.add_argument("--notify-port", type=int, default=8787, help="本地回调端口（与脚本一致）")
+    ap.add_argument("--single-page", action="store_true", help="单页面模式：在固定页面上批量取消订阅，避免触发速率限制")
+    ap.add_argument("--single-page-url", type=str, default="", help="单页面模式使用的固定 URL（默认使用列表中的第一个）")
     args = ap.parse_args()
 
     if not args.xlsx.exists():
@@ -179,25 +226,60 @@ def main():
                     u = add_or_update_query(u, "appid", appid)
         final.append(set_hash_flag(u, "bulk_unsub=1"))
 
-    # 建队列（先取出前 batch-size 个作“首批”，剩余进入队列）
-    batch = max(1, args.batch_size)
-    first = final[:batch]
-    rest  = final[batch:]
-    global QUEUE
-    QUEUE = UrlQueue(rest)
+    # 单页面模式
+    if args.single_page:
+        print("[MODE] 单页面模式：所有取消订阅操作将在固定页面上运行")
+        QUEUE = UrlQueue(final, single_page_mode=True)
+        
+        # 确定要打开的固定页面
+        if args.single_page_url:
+            base_url = args.single_page_url
+        elif final:
+            base_url = final[0]
+        else:
+            print("错误：没有可用的 URL"); return
+        
+        # 确保 URL 带有 bulk_unsub=1 标记
+        base_url = set_hash_flag(base_url, "bulk_unsub=1")
+        
+        # 启动回调服务
+        srv = start_server(args.notify_port)
+        print(f"[SERVER] http://127.0.0.1:{args.notify_port}")
+        print(f"[SERVER] - /next   : 获取下一个 workshop ID")
+        print(f"[SERVER] - /batch  : 批量获取 workshop ID")
+        print(f"[SERVER] - /stats  : 查看队列统计")
+        print(f"[QUEUE] total={len(final)} 个项目待取消订阅")
+        
+        # 打开固定数量的标签（避免打开太多）
+        batch = min(args.batch_size, 5)  # 单页面模式最多打开 5 个标签
+        print(f"[OPEN] 打开 {batch} 个固定页面标签...")
+        for i in range(batch):
+            open_url(base_url)
+            print(f"[OPEN] {i+1}/{batch}: {base_url}")
+            time.sleep(0.5)  # 稍微延迟，避免同时打开太多
+        
+        print("[RUNNING] 单页面模式运行中...（控制台会打印取消订阅进度）")
+        
+    # 多页面模式（原有逻辑）
+    else:
+        print("[MODE] 多页面模式：每个项目打开一个单独的页面")
+        batch = max(1, args.batch_size)
+        first = final[:batch]
+        rest  = final[batch:]
+        QUEUE = UrlQueue(rest, single_page_mode=False)
 
-    # 启动回调服务
-    srv = start_server(args.notify_port)
-    print(f"[SERVER] http://127.0.0.1:{args.notify_port}/next  （标签完成后会来这里拉取下一条）")
-    print(f"[QUEUE] total={len(final)}  pool={batch}  remaining_in_queue={len(rest)}")
+        # 启动回调服务
+        srv = start_server(args.notify_port)
+        print(f"[SERVER] http://127.0.0.1:{args.notify_port}/next  （标签完成后会来这里拉取下一条）")
+        print(f"[QUEUE] total={len(final)}  pool={batch}  remaining_in_queue={len(rest)}")
 
-    # 打开首批标签（只开 batch 个）
-    opened = 0
-    for u in first:
-        open_url(u); opened += 1
-        print(f"[OPEN] {opened}/{batch}: {u}")
+        # 打开首批标签（只开 batch 个）
+        opened = 0
+        for u in first:
+            open_url(u); opened += 1
+            print(f"[OPEN] {opened}/{batch}: {u}")
 
-    print("[RUNNING] 等待各标签完成后自行拉取下一条…（控制台会打印 NEXT 分配信息）")
+        print("[RUNNING] 等待各标签完成后自行拉取下一条…（控制台会打印 NEXT 分配信息）")
 
     try:
         while True:
