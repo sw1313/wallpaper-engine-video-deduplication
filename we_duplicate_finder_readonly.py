@@ -10,9 +10,12 @@ Wallpaper Engine (431960) 重复视频检测
 - 导出 CSV/XLSX：每组一行，组内链接按该条目命中的最大文件大小降序
 - 进度条：整体仍有 S1/S2 两个 tqdm
 
-用法：
-  python we_duplicate_finder_readonly.py -c config.toml --verbose --trace
-  # 如需关闭进度条：加 --no-progress
+现在的“重复判定”逻辑（与原版不同）：
+  1. 先按“时长分桶 +（可选）音频指纹”做粗分桶；
+  2. 在同一个粗桶内，使用 phash_parts 做模糊匹配：
+     - 计算任意两个文件的 pHash 平均汉明距离；
+     - 若距离 <= 配置 phash_distance_threshold（默认 8），就 union 成同一组；
+     - 最终把每个 union-find 结果当成一组候选重复。
 """
 
 import argparse
@@ -35,6 +38,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from threading import Lock
+from functools import lru_cache  # NEW: 缓存 hex->ImageHash
 
 try:
     import tomllib  # py311+
@@ -69,6 +73,9 @@ class Config:
 
     duration_rounding: str = "int"      # "int" 或 "nearest_0.5"
     require_both_signatures: bool = True
+
+    # —— pHash 模糊匹配参数 ——
+    phash_distance_threshold: float = 8.0  # NEW: pHash 平均汉明距离阈值（越小越严格）
 
     # —— 并行与超时 ——
     max_workers_stage1: int = 8         # 阶段1（测时长）线程数
@@ -585,6 +592,85 @@ def stage1_and_stage2_pipelined(items_map: Dict[str, List[Path]], cfg: Config) -
     LOGGER.info("[PIPE] 完成：签名文件数=%d", len(filesigs))
     return filesigs
 
+# ----------------------------- pHash 模糊匹配工具 -----------------------------
+
+@lru_cache(maxsize=8192)
+def _hex_to_hash_cached(h: str) -> imagehash.ImageHash:
+    """缓存 hex->ImageHash，避免重复解析带来的开销。"""
+    return imagehash.hex_to_hash(h)
+
+def phash_distance(fs1: FileSig, fs2: FileSig) -> float:
+    """
+    计算两个文件的“平均 pHash 汉明距离”：
+      - 取两者 phash_parts 的 min(len1, len2) 个
+      - 对应位置两两计算汉明距离，取平均值
+    """
+    p1 = fs1.phash_parts
+    p2 = fs2.phash_parts
+    if not p1 or not p2:
+        return float("inf")
+    n = min(len(p1), len(p2))
+    if n == 0:
+        return float("inf")
+
+    total = 0.0
+    for i in range(n):
+        try:
+            h1 = _hex_to_hash_cached(p1[i])
+            h2 = _hex_to_hash_cached(p2[i])
+            total += (h1 - h2)  # imagehash.ImageHash 的“-”运算符返回汉明距离
+        except Exception as e:
+            LOGGER.debug("[phash_distance] 计算失败：%s", e)
+            return float("inf")
+    return total / float(n)
+
+def cluster_bucket_by_phash(fs_list: List[FileSig], threshold: float) -> List[List[FileSig]]:
+    """
+    在同一个“粗桶”（时长 + 可选音频）里，对文件做 pHash 模糊聚类：
+      - 任意两文件的 pHash 平均距离 <= threshold 就 union；
+      - 使用并查集得到最终若干子组；
+      - 只返回大小 >= 2 的子组。
+    """
+    n = len(fs_list)
+    if n < 2:
+        return []
+
+    parent = list(range(n))
+    rank = [0] * n
+
+    def find(x: int) -> int:
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(a: int, b: int):
+        ra, rb = find(a), find(b)
+        if ra == rb:
+            return
+        if rank[ra] < rank[rb]:
+            parent[ra] = rb
+        elif rank[ra] > rank[rb]:
+            parent[rb] = ra
+        else:
+            parent[rb] = ra
+            rank[ra] += 1
+
+    # 两两比较并 union
+    for i in range(n):
+        for j in range(i + 1, n):
+            d = phash_distance(fs_list[i], fs_list[j])
+            if d <= threshold:
+                union(i, j)
+
+    clusters_dict: Dict[int, List[FileSig]] = defaultdict(list)
+    for idx in range(n):
+        root = find(idx)
+        clusters_dict[root].append(fs_list[idx])
+
+    # 只保留至少 2 个文件的子组
+    return [lst for lst in clusters_dict.values() if len(lst) >= 2]
+
 # ----------------------------- 导出 -----------------------------
 
 def export_csv(groups: List[List[str]], out_csv: Path):
@@ -640,6 +726,8 @@ def load_config(path: Optional[Path]) -> Config:
         duration_rounding = get("duration_rounding", "int"),
         require_both_signatures = bool(get("require_both_signatures", True)),
 
+        phash_distance_threshold = float(get("phash_distance_threshold", 8.0)),
+
         max_workers_stage1 = int(get("max_workers_stage1", 8)),
         max_workers_stage2 = int(get("max_workers_stage2", 6)),
         ffprobe_timeout = int(get("ffprobe_timeout", 25)),
@@ -651,7 +739,7 @@ def load_config(path: Optional[Path]) -> Config:
 
 def main():
     ap = argparse.ArgumentParser(
-        description="Wallpaper Engine 重复视频检测（管线并行：时长分桶 + 中段取样签名 + 进度条）"
+        description="Wallpaper Engine 重复视频检测（管线并行 + pHash 模糊匹配）"
     )
     ap.add_argument("-c", "--config", type=Path, default=None, help="config.toml")
     ap.add_argument("--verbose", action="store_true", help="DEBUG 级别日志")
@@ -666,6 +754,8 @@ def main():
         cfg.progress = False
 
     setup_logging(logging.DEBUG if cfg.verbose else logging.INFO, cfg.log_file)
+
+    LOGGER.info("[CFG] phash_distance_threshold=%.2f（数值越小越严格）", cfg.phash_distance_threshold)
 
     root = Path(cfg.workshop_root).resolve()
     out_dir = Path(cfg.output_dir).resolve()
@@ -682,26 +772,49 @@ def main():
     eligible: List[FileSig] = []
     for fs in filesigs:
         if cfg.require_both_signatures:
-            if fs.duration_bucket and fs.phash_digest and fs.audio_fp_digest:
+            if fs.duration_bucket and fs.phash_parts and fs.audio_fp_digest:
                 eligible.append(fs)
         else:
-            if fs.duration_bucket and fs.phash_digest:
+            if fs.duration_bucket and fs.phash_parts:
                 eligible.append(fs)
     LOGGER.info("[INFO] 可参与最终分组的文件：%d / %d（候选）", len(eligible), len(filesigs))
 
-    # 最终分组键：时长分桶 + 视觉 +（可选）音频
-    def gkey(fs: FileSig):
-        return (fs.duration_bucket, fs.phash_digest,
-                fs.audio_fp_digest if cfg.require_both_signatures else None)
+    if not eligible:
+        LOGGER.info("[INFO] 无可用签名文件，结束。")
+        return
 
-    groups_map: Dict[Tuple[str, str, Optional[str]], List[FileSig]] = defaultdict(list)
+    # 粗分桶：按“时长分桶 +（可选）音频指纹”
+    def bucket_key(fs: FileSig):
+        if cfg.require_both_signatures:
+            return (fs.duration_bucket, fs.audio_fp_digest)
+        else:
+            return (fs.duration_bucket,)
+
+    bucket_groups: Dict[Tuple, List[FileSig]] = defaultdict(list)
     for fs in eligible:
-        groups_map[gkey(fs)].append(fs)
+        bucket_groups[bucket_key(fs)].append(fs)
 
-    # 组织导出：同组内去重到“不同 item”，并按该 item 命中的最大文件大小降序
+    LOGGER.info(
+        "[INFO] 粗分桶数量：%d（按时长%s）",
+        len(bucket_groups),
+        "+音频" if cfg.require_both_signatures else ""
+    )
+
+    # 在每个粗桶内用 phash_parts 做模糊聚类
+    all_duplicate_groups: List[List[FileSig]] = []
+    for bkey, flist in bucket_groups.items():
+        if len(flist) < 2:
+            continue
+        clusters = cluster_bucket_by_phash(flist, cfg.phash_distance_threshold)
+        if not clusters:
+            continue
+        all_duplicate_groups.extend(clusters)
+        LOGGER.info("[dup-bucket] 粗桶 %s 内 fuzzy 子组数=%d", bkey, len(clusters))
+
+    # 组织导出：对每个 fuzzy 组，合并到“不同 item”，并按该 item 命中的最大文件大小降序
     duplicate_groups_urls: List[List[str]] = []
     kept_groups = 0
-    for key, group in groups_map.items():
+    for group in all_duplicate_groups:
         item_to_bestsize: Dict[str, int] = {}
         item_to_url: Dict[str, str] = {}
         for fs in group:
@@ -714,8 +827,11 @@ def main():
         urls = [item_to_url[iid] for iid, _ in ordered]
         duplicate_groups_urls.append(urls)
         kept_groups += 1
-        LOGGER.info("[dup] 组 %s 大小=%d → %s", key, len(urls),
-                    [u.rsplit('=',1)[-1] for u in urls])
+        LOGGER.info(
+            "[dup] fuzzy 组 #%d → items=%s",
+            kept_groups,
+            [u.rsplit('=', 1)[-1] for u in urls]
+        )
 
     # 导出
     ts = time.strftime("%Y%m%d_%H%M%S")
@@ -727,7 +843,7 @@ def main():
         LOGGER.info("[OUT] CSV : %s", out_csv)
         LOGGER.info("[OUT] XLSX: %s", out_xlsx)
     else:
-        LOGGER.info("[INFO] 未发现重复组（满足当前判定条件）")
+        LOGGER.info("[INFO] 未发现重复组（在当前 fuzzy 条件下）")
 
     LOGGER.info("[DONE] 任务完成，重复组数：%d", kept_groups)
 
