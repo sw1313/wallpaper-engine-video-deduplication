@@ -8,6 +8,6 @@ wallpaper engine视频筛重，取消订阅重复视频
 步骤4：执行：`python we_duplicate_finder_readonly.py -c config.toml`，执行完成生成的文件在脚本子目录`output`文件夹内  
 步骤5：在默认浏览器中登录steam账号  
 步骤6：在浏览器中安装tampermonkey等脚本插件，导入`wallpaper-engine-video-deduplication.js`文件  
-步骤7：进入output目录，在路径下执行：`python bulk_unsub_controller.py --xlsx xxx.xlsx --batch-size 1`  
+步骤7：进入output目录，在路径下执行：`python bulk_unsub_controller.py --xlsx xxx.xlsx --batch-size 1 --single-page`  
 其中`xxx.xlsx`为执行：`python we_duplicate_finder_readonly.py -c config.toml`最后在`output`文件夹生成的xlsx文件名称  
 PS:如果网络不稳定导致取消订阅的时候卡住了，刷新下标签页就行
