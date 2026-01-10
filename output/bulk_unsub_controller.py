@@ -232,12 +232,14 @@ def main():
         QUEUE = UrlQueue(final, single_page_mode=True)
         
         # 确定要打开的固定页面
+        # 默认改为“已订阅物品主页”，避免依赖某个具体创意工坊详情页
+        # - /my/ 会自动指向当前登录账号
+        # - appid=431960：Wallpaper Engine（如你需要全局订阅列表，可手动去掉该参数）
+        default_subs_url = "https://steamcommunity.com/my/myworkshopfiles/?browsesort=mysubscriptions&browsefilter=mysubscriptions&appid=431960&p=1"
         if args.single_page_url:
             base_url = args.single_page_url
-        elif final:
-            base_url = final[0]
         else:
-            print("错误：没有可用的 URL"); return
+            base_url = default_subs_url
         
         # 确保 URL 带有 bulk_unsub=1 标记
         base_url = set_hash_flag(base_url, "bulk_unsub=1")
@@ -281,17 +283,34 @@ def main():
 
         print("[RUNNING] 等待各标签完成后自行拉取下一条…（控制台会打印 NEXT 分配信息）")
 
+    print("\n[提示] 打开浏览器控制台(F12)可以查看详细执行日志")
+    print("[提示] 按 Ctrl+C 可以随时停止")
+    
     try:
+        last_done = 0
+        check_interval = 0
         while True:
             time.sleep(1)
+            check_interval += 1
             st = QUEUE.stats()
-            # 你也可以在这里打印 st 进度
-            # print("[STATS]", st)
-            if st['left']==0:
-                # 队列空了就继续等，直到所有标签停下（自愿结束即可）
-                pass
+            
+            # 每5秒打印一次进度
+            if check_interval >= 5:
+                check_interval = 0
+                if st['done'] > last_done:
+                    print(f"[进度] 已完成: {st['done']} | 队列剩余: {st['left']} | 已分配: {st['assigned']}")
+                    last_done = st['done']
+            
+            if st['left']==0 and st['assigned'] == st['done']:
+                # 队列空了且所有任务都完成了
+                print(f"\n[完成] 所有任务已处理完毕！")
+                print(f"[统计] 总计处理: {st['done']} 个项目")
+                print(f"[提示] 请查看浏览器控制台确认实际成功/失败数量")
+                break
     except KeyboardInterrupt:
-        print("\n[EXIT] 停止。")
+        st = QUEUE.stats()
+        print(f"\n[EXIT] 用户中断")
+        print(f"[统计] 已完成: {st['done']} | 剩余: {st['left']}")
     finally:
         srv.shutdown(); srv.server_close()
 
