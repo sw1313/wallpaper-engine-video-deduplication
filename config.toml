@@ -10,17 +10,31 @@ ffprobe_path = "ffprobe"
 fpcalc_path  = "fpcalc"
 
 # —— 中段取样设置 ——
-video_window_seconds = 20
-audio_window_seconds = 120
+# video_window_seconds: 视频采样窗口（秒）
+#   - 对短视频：窗口会自动缩小到视频时长
+#   - 对长视频：从中间取这么长的片段
+video_window_seconds = 15
+audio_window_seconds = 60
 seek_ratio = 0.5
 
 # pHash / 指纹
-sample_frames = 12
-phash_size    = 8
+# sample_frames: 采样帧数 - 关键参数！
+#   - 不使用音频指纹时，建议 30-40 帧以提高精度
+#   - 更多帧 = 更精确的指纹 = 减少误判
+sample_frames = 36
+# phash_size: pHash 哈希大小
+#   - 增加到 12 可以提高精度，避免动作相似的误判
+phash_size    = 12
+# phash_distance_threshold: 相似度阈值
+#   - 不使用音频时建议更严格：3.0-4.0
+#   - 当前值适合识别完全相同的视频
+phash_distance_threshold = 5.0
 
 # 时长分桶
-duration_rounding = "nearest_0.3"          # 或 "nearest_0.5"
-require_both_signatures = false     # 音频经常缺失可改为 false（只看视觉）
+duration_rounding = "nearest_1.0"          # 或 "nearest_0.5"
+# require_both_signatures: 是否同时要求视频和音频指纹匹配
+#   - false: 只看视频画面，速度快但需要更严格的视觉参数
+require_both_signatures = false
 
 # —— 并行与超时 ——
 max_workers_stage1 = 8             # 阶段1：并行测时长
