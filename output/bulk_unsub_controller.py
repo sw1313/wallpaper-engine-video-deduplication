@@ -22,6 +22,8 @@ class UrlQueue:
         self.urls = deque(urls)
         self.assigned = 0
         self.done = 0
+        self.ok = 0
+        self.fail = 0
         self.single_page_mode = single_page_mode
     def pop(self) -> str:
         with self.lock:
@@ -30,10 +32,14 @@ class UrlQueue:
             return self.urls.popleft()
     def stats(self):
         with self.lock:
-            return dict(left=len(self.urls), assigned=self.assigned, done=self.done)
-    def mark_done(self):
+            return dict(left=len(self.urls), assigned=self.assigned, done=self.done, ok=self.ok, fail=self.fail)
+    def mark_done(self, ok: bool|None = None):
         with self.lock:
             self.done += 1
+            if ok is True:
+                self.ok += 1
+            elif ok is False:
+                self.fail += 1
 
 QUEUE: UrlQueue|None = None
 
@@ -47,7 +53,7 @@ def _cors(h):
 class Handler(BaseHTTPRequestHandler):
     def do_OPTIONS(self):
         path = self.path.rstrip('/')
-        if path not in ["/next", "/batch", "/stats"]:
+        if path not in ["/next", "/batch", "/stats", "/report"]:
             self.send_response(404); _cors(self); self.end_headers(); return
         self.send_response(204); _cors(self); self.end_headers()
     
@@ -55,7 +61,7 @@ class Handler(BaseHTTPRequestHandler):
         path = self.path.rstrip('/')
         # 获取统计信息
         if path == "/stats":
-            stats = QUEUE.stats() if QUEUE else {"left": 0, "assigned": 0, "done": 0}
+            stats = QUEUE.stats() if QUEUE else {"left": 0, "assigned": 0, "done": 0, "ok": 0, "fail": 0}
             self.send_response(200); _cors(self)
             self.send_header("Content-Type","application/json"); self.end_headers()
             self.wfile.write(json.dumps(stats).encode('utf-8'))
@@ -82,7 +88,7 @@ class Handler(BaseHTTPRequestHandler):
     
     def do_POST(self):
         path = self.path.rstrip('/')
-        if path != "/next":
+        if path not in ["/next", "/report"]:
             self.send_response(404); _cors(self); self.end_headers(); return
         length = int(self.headers.get('Content-Length','0') or 0)
         raw = self.rfile.read(length) if length else b'{}'
@@ -93,19 +99,37 @@ class Handler(BaseHTTPRequestHandler):
         slot   = (data.get('slot') or '')
         wid    = (data.get('id')   or '')
         status = (data.get('status') or '')
-        url    = (data.get('url') or '')
-        if QUEUE: QUEUE.mark_done()
-        
+        ok_flag = data.get('ok', None)
+
+        # 推断成功/失败（允许前端直接传 ok=true/false；否则按 status 粗略判断）
+        ok: bool|None = None
+        if isinstance(ok_flag, bool):
+            ok = ok_flag
+        else:
+            s = str(status or '').lower()
+            if 'fail' in s or 'error' in s:
+                ok = False
+            elif s:
+                ok = True
+
+        if QUEUE:
+            QUEUE.mark_done(ok)
+
+        if path == "/report":
+            # 单页面模式：只上报结果，不分配下一条，避免“吞队列”
+            print(f"[REPORT] id={wid} status={status} ok={ok}")
+            self.send_response(200); _cors(self); self.send_header("Content-Type","application/json"); self.end_headers()
+            self.wfile.write(json.dumps({"ok": True}).encode('utf-8'))
+            return
+
+        # /next：多页面模式继续分配下一条
         nxt = QUEUE.pop() if QUEUE else ""
-        
-        # 单页面模式：返回 workshop ID 而不是完整 URL
         if QUEUE and QUEUE.single_page_mode and nxt:
             nxt_id = extract_workshop_id(nxt)
             print(f"[NEXT] slot={slot} id={wid} status={status} -> {'ASSIGN ID ' + nxt_id if nxt_id else 'EMPTY'}")
             self.send_response(200); _cors(self); self.send_header("Content-Type","application/json"); self.end_headers()
             self.wfile.write(json.dumps({"id": nxt_id, "url": ""}).encode('utf-8'))
         else:
-            # 多页面模式：返回完整 URL（兼容原有逻辑）
             print(f"[NEXT] slot={slot} id={wid} status={status} -> {'ASSIGN ' + nxt if nxt else 'EMPTY'}")
             self.send_response(200); _cors(self); self.send_header("Content-Type","application/json"); self.end_headers()
             self.wfile.write(json.dumps({"url": nxt}).encode('utf-8'))
@@ -137,17 +161,50 @@ def open_url(url: str):
         webbrowser.open_new_tab(url)
 
 # ========== Excel & URL 工具 ==========
-def read_urls_from_xlsx(xlsx_path: Path) -> List[str]:
+def read_urls_from_xlsx(xlsx_path: Path, keep_first_http_per_row: bool = False) -> List[str]:
     wb = load_workbook(filename=str(xlsx_path), read_only=True, data_only=True)
     ws = wb.active
     out: List[str] = []
-    header = True
-    for row in ws.iter_rows(values_only=True):
-        if header: header=False; continue
-        for cell in row[2:]:
+    it = ws.iter_rows(values_only=True)
+    header = next(it, None)  # noqa: F841
+    first = next(it, None)
+    if not first:
+        wb.close()
+        return out
+
+    def first_http_idx(r):
+        for i, cell in enumerate(r):
+            if isinstance(cell, str) and cell.strip().startswith("http"):
+                return i
+        return None
+
+    start_idx = first_http_idx(first)
+    # 兼容不同来源的 Excel：
+    # - 本仓库筛重导出的 duplicates_*.xlsx：链接从 B 列开始（索引 1）
+    # - 旧格式/其他来源：可能从 C 列开始（索引 2）
+    if start_idx is None:
+        start_idx = 2
+
+    def collect_http_cells(row):
+        urls: List[str] = []
+        for cell in row[start_idx:]:
             if isinstance(cell, str):
                 u = cell.strip()
-                if u.startswith("http"): out.append(u)
+                if u.startswith("http"):
+                    urls.append(u)
+        return urls
+
+    def consume_row(row):
+        urls = collect_http_cells(row)
+        if keep_first_http_per_row and urls:
+            urls = urls[1:]  # 每组保留第一个链接（筛重导出已按最大文件排序）
+        out.extend(urls)
+
+    consume_row(first)
+    for row in it:
+        if not row:
+            continue
+        consume_row(row)
     wb.close()
     return out
 
@@ -201,11 +258,13 @@ def main():
     ap.add_argument("--notify-port", type=int, default=8787, help="本地回调端口（与脚本一致）")
     ap.add_argument("--single-page", action="store_true", help="单页面模式：在固定页面上批量取消订阅，避免触发速率限制")
     ap.add_argument("--single-page-url", type=str, default="", help="单页面模式使用的固定 URL（默认使用列表中的第一个）")
+    ap.add_argument("--keep-largest-in-group", action="store_true",
+                    help="适配筛重导出的 duplicates_*.xlsx：每行第一个链接为最大项，保留它，其余链接才执行取消订阅")
     args = ap.parse_args()
 
     if not args.xlsx.exists():
         print(f"找不到文件：{args.xlsx}"); return
-    raw = read_urls_from_xlsx(args.xlsx)
+    raw = read_urls_from_xlsx(args.xlsx, keep_first_http_per_row=bool(args.keep_largest_in_group))
     if not raw:
         print("Excel 中未找到链接（从 C 列开始）。"); return
 
@@ -285,7 +344,7 @@ def main():
 
     print("\n[提示] 打开浏览器控制台(F12)可以查看详细执行日志")
     print("[提示] 按 Ctrl+C 可以随时停止")
-    
+
     try:
         last_done = 0
         check_interval = 0
@@ -298,19 +357,19 @@ def main():
             if check_interval >= 5:
                 check_interval = 0
                 if st['done'] > last_done:
-                    print(f"[进度] 已完成: {st['done']} | 队列剩余: {st['left']} | 已分配: {st['assigned']}")
+                    print(f"[进度] 已完成: {st['done']}（成功:{st.get('ok',0)} 失败:{st.get('fail',0)}） | 队列剩余: {st['left']} | 已分配: {st['assigned']}")
                     last_done = st['done']
             
             if st['left']==0 and st['assigned'] == st['done']:
                 # 队列空了且所有任务都完成了
                 print(f"\n[完成] 所有任务已处理完毕！")
-                print(f"[统计] 总计处理: {st['done']} 个项目")
+                print(f"[统计] 总计处理: {st['done']} 个项目（成功:{st.get('ok',0)} 失败:{st.get('fail',0)}）")
                 print(f"[提示] 请查看浏览器控制台确认实际成功/失败数量")
                 break
     except KeyboardInterrupt:
         st = QUEUE.stats()
         print(f"\n[EXIT] 用户中断")
-        print(f"[统计] 已完成: {st['done']} | 剩余: {st['left']}")
+        print(f"[统计] 已完成: {st['done']}（成功:{st.get('ok',0)} 失败:{st.get('fail',0)}） | 剩余: {st['left']}")
     finally:
         srv.shutdown(); srv.server_close()
 
