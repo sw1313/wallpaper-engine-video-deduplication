@@ -48,3 +48,11 @@ fpcalc_timeout  = 35
 # —— 日志 / UI ——
 log_file = "we_duplicate.log"
 progress = true                    # 如果想默认关闭进度条改为 false
+
+# —— 下架归档 ——
+# Wallpaper Engine 安装目录（包含 config.json 的那个目录）
+we_install_dir = "E:\\SteamLibrary\\steamapps\\common\\wallpaper_engine"
+# Steam Web API Key（免费申请：https://steamcommunity.com/dev/apikey）
+# 有 key 时使用 IPublishedFileService（推荐，检测更准确）
+# 没 key 时回退到 ISteamRemoteStorage（无需认证但可能漏检部分私密物品）
+steam_api_key = ""
