@@ -25,10 +25,12 @@ sample_frames = 36
 # phash_size: pHash 哈希大小
 #   - 增加到 12 可以提高精度，避免动作相似的误判
 phash_size    = 12
-# phash_distance_threshold: 相似度阈值
-#   - 不使用音频时建议更严格：3.0-4.0
-#   - 当前值适合识别完全相同的视频
-phash_distance_threshold = 5.0
+# phash_distance_threshold: 组合距离分阈值
+#   - 算法: 截尾均值 / (1 + 标准差)
+#   - 同视频不同分辨率: 分数 ~0.5
+#   - 不同内容同模板: 分数 >0.7
+#   - 推荐值 0.5~0.7（默认 0.6）
+phash_distance_threshold = 0.6
 
 # 时长分桶
 duration_rounding = "nearest_1.0"          # 或 "nearest_0.5"
