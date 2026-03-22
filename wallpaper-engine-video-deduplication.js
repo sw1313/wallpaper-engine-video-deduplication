@@ -1,20 +1,26 @@
 // ==UserScript==
 // @name         Steam Workshop 取消订阅·固定池轮转（server/local兼容）+ 错误页面处理 + 单页面模式
 // @namespace    local.bulk-unsub
-// @version      19.0.1
-// @description  仅当 URL 含 #bulk_unsub=1：自动退订并通过 cb 或本机端口拉取下一条；兼容服务器 /unsub/next 与本机 127.0.0.1:8787。单页面模式默认极速（fast=1：不验证不重试，只看接口返回），可切换 fast=0 启用慢速验证模式。
+// @version      20.0.0
+// @description  自动退订（URL 含 #bulk_unsub=1）+ 订阅主页 postMessage 投递队列 + ★新增：油猴菜单“手动取消订阅…（输入ID）”，方便取消已下架物品。
 // @match        https://steamcommunity.com/sharedfiles/filedetails/*
 // @match        https://steamcommunity.com/my/myworkshopfiles*
 // @match        https://steamcommunity.com/profiles/*/myworkshopfiles*
 // @match        https://steamcommunity.com/id/*/myworkshopfiles*
 // @run-at       document-end
 // @grant        GM_xmlhttpRequest
+// @grant        GM_registerMenuCommand
 // @connect      *
 // ==/UserScript==
 
 (function () {
   'use strict';
-  if (!/(\b|#|&)bulk[_-]?unsub=1\b/i.test(location.hash||'')) return;
+  const BULK_UNSUB_VAL = (function(){
+    const m = (location.hash||'').match(/(\b|#|&)bulk[_-]?unsub=([12])\b/i);
+    return m ? m[2] : '';
+  })();
+  const IS_BULK_UNSUB = !!BULK_UNSUB_VAL;
+  const IS_DELISTED_MODE = BULK_UNSUB_VAL === '2';
 
   function parseHashParam(name){
     // 值里可能包含 '='（例如 cb=http://...?...=...），不能 split('=') 直接拆
@@ -43,6 +49,16 @@
       const base = String(apiNext||"").replace("/next", "/batch");
       const sep = base.includes("?") ? "&" : "?";
       return base + sep + "size=" + encodeURIComponent(String(size));
+    }
+  }
+
+  function buildReportUrl(apiNext){
+    try{
+      const u = new URL(String(apiNext));
+      u.pathname = u.pathname.replace(/\/next\/?$/i, "/report");
+      return u.toString();
+    }catch(_){
+      return String(apiNext||"").replace("/next", "/report");
     }
   }
 
@@ -137,7 +153,7 @@
 
   // 直接通过API取消订阅（用于错误页面）
   // 返回 { success: boolean, verified: boolean, reason?: string }
-  async function unsubscribeByAPI(id, appid, retries = 3){
+  async function unsubscribeByAPI(id, appid, retries = 3, fastOverride = null){
     const sessionid = get_sessionid();
     if (!sessionid) {
       console.warn('[API] 无法获取sessionid');
@@ -145,9 +161,10 @@
     }
 
     const appidFinal = normalizeAppId(appid);
+    const USE_FAST = (fastOverride === null || fastOverride === undefined) ? FAST_MODE : !!fastOverride;
 
     // 极速模式：只发一次请求，不做任何校验/重试（仅看接口返回）
-    if (FAST_MODE) {
+    if (USE_FAST) {
       try{
         const formData = new FormData();
         formData.append('id', String(id));
@@ -239,6 +256,70 @@
     return { success: false, verified: false, reason: 'exhausted' };
   }
 
+  // =========================
+  // 油猴菜单：手动取消订阅（输入ID）
+  // =========================
+  function _parseIdsFromText(s){
+    const m = String(s||"").match(/\d+/g) || [];
+    const out = [];
+    const seen = new Set();
+    for (const x of m){
+      const id = String(x).trim();
+      if (!id) continue;
+      if (seen.has(id)) continue;
+      seen.add(id);
+      out.push(id);
+    }
+    return out;
+  }
+  function _ensureManualUI(){
+    let div = document.getElementById("tm-manual-unsub");
+    if (div) return div;
+    div = document.createElement("div");
+    div.id = "tm-manual-unsub";
+    div.style.cssText = "position:fixed;top:10px;left:10px;right:auto;max-width:520px;padding:12px 14px;background:rgba(0,0,0,.85);color:#fff;border-radius:10px;box-shadow:0 6px 18px rgba(0,0,0,.35);z-index:99999;font:14px/1.35 system-ui,-apple-system,Segoe UI,Roboto,Arial;";
+    div.innerHTML = "<div style='font-weight:700;margin-bottom:6px;'>🧹 手动取消订阅</div><div id='tm-manual-unsub-text'>准备中…</div><div style='margin-top:8px;opacity:.75;font-size:12px;'>提示：可一次输入多个ID（逗号/空格/换行分隔）</div>";
+    try{ document.body.appendChild(div); }catch(_){}
+    return div;
+  }
+  function _setManualText(t){
+    const ui = _ensureManualUI();
+    const el = ui.querySelector("#tm-manual-unsub-text");
+    if (el) el.textContent = String(t||"");
+  }
+  async function _manualUnsubFlow(ids, {fast=true}={}){
+    const list = Array.isArray(ids) ? ids : [];
+    if (!list.length) return;
+    _ensureManualUI();
+    let ok=0, fail=0;
+    for (let i=0; i<list.length; i++){
+      const id = list[i];
+      _setManualText(`处理中 ${i+1}/${list.length}：${id}（成功:${ok} 失败:${fail}）`);
+      const r = await unsubscribeByAPI(id, DEFAULT_APPID, 3, fast);
+      const success = !!(r && r.success);
+      if (success) ok++; else fail++;
+      await new Promise(res=>setTimeout(res, 120));
+    }
+    _setManualText(`完成：成功 ${ok}，失败 ${fail}（详情见控制台）`);
+    setTimeout(()=>{ try{ document.getElementById("tm-manual-unsub")?.remove(); }catch(_){} }, 12000);
+  }
+  function registerManualMenu(){
+    if (typeof GM_registerMenuCommand !== "function") return;
+    GM_registerMenuCommand("手动取消订阅…（输入ID）", async ()=>{
+      const raw = prompt("输入/粘贴创意工坊ID（可多个，用逗号/空格/换行分隔）：", "");
+      if (raw === null) return;
+      const ids = _parseIdsFromText(raw);
+      if (!ids.length){
+        alert("未识别到任何ID（需要纯数字ID）。");
+        return;
+      }
+      const fast = confirm(`识别到 ${ids.length} 个ID。\n\n确定用“极速模式”取消订阅吗？\n- 确定：极速（更快，不做验证/重试）\n- 取消：验证模式（更慢，带检测/重试）`);
+      console.log("[手动取消订阅] IDs=", ids, "fast=", fast);
+      await _manualUnsubFlow(ids, { fast });
+    });
+  }
+  registerManualMenu();
+
   // 全局变量：单页面模式标记
   let SINGLE_PAGE_MODE = false;
   let PROCESSING = false;
@@ -291,6 +372,22 @@
         const r = await unsubscribeByAPI(id, DEFAULT_APPID, FAST_MODE ? 1 : 3);
         const success = !!(r && r.success);
         if (success) MSG_QUEUE.ok++; else MSG_QUEUE.fail++;
+
+        // 若 API_NEXT 指向本机 controller，则上报进度（/report 不会弹出队列）
+        try{
+          await new Promise(res=>{
+            GM_xmlhttpRequest({
+              method:"POST",
+              url: buildReportUrl(API_NEXT),
+              headers:{ "Content-Type":"application/json" },
+              data: JSON.stringify({ id, status: success ? "ok" : "fail", ok: success }),
+              onload: ()=>res(null),
+              onerror: ()=>res(null),
+              ontimeout: ()=>res(null),
+              timeout: 2000
+            });
+          });
+        }catch(_){}
 
         // 逐个 ID 更新各 reqId 的完成度，全部完成后给 opener 回执 bulk_unsub_done
         for (const [reqId, st] of REQS.entries()){
@@ -525,6 +622,8 @@
   }
 
   (function netProbe(){
+    // 只在“作品详情页”启用 netProbe。订阅主页/单页队列模式下启用会导致 /next 被频繁触发，从而“吞队列”。
+    if (!/\/sharedfiles\/filedetails\//i.test(location.pathname || "")) return;
     if (window.__bulk_unsub_net_patched) return; window.__bulk_unsub_net_patched = true;
     const of = window.fetch?.bind(window);
     if (of){
@@ -533,7 +632,7 @@
         const body = init && init.body ? String(init.body) : '';
         const s = (url + ' ' + body).toLowerCase();
         const isUnsub = /\/sharedfiles\/unsubscribe/.test(s);
-        return of(res, init).then(r=>{ if(isUnsub && r && r.status===200) goNext('net_unsub'); return r; });
+        return of(res, init).then(r=>{ if(isUnsub && r && r.status===200 && !SINGLE_PAGE_MODE) goNext('net_unsub'); return r; });
       };
     }
     const X = window.XMLHttpRequest;
@@ -543,7 +642,7 @@
       X.prototype.send=function(b){
         const body=b?String(b):''; const url=String(this.__url||'').toLowerCase();
         const isUnsub=/\/sharedfiles\/unsubscribe/.test(url+' '+body);
-        this.addEventListener('loadend',()=>{ if(isUnsub && this.status===200) goNext('net_unsub'); });
+        this.addEventListener('loadend',()=>{ if(isUnsub && this.status===200 && !SINGLE_PAGE_MODE) goNext('net_unsub'); });
         return send.call(this,b);
       };
     }
@@ -585,7 +684,8 @@
       progressDiv = document.createElement('div');
       progressDiv.id = 'bulk-unsub-progress';
       progressDiv.style.cssText = 'position:fixed;top:10px;right:10px;padding:15px 20px;background:rgba(0,0,0,0.85);color:#fff;border-radius:8px;box-shadow:0 4px 12px rgba(0,0,0,0.3);z-index:99999;font-family:Arial,sans-serif;font-size:14px;min-width:250px;';
-      progressDiv.innerHTML = '<div style="font-weight:bold;margin-bottom:8px;">🔄 批量取消订阅中...</div><div id="progress-text">初始化...</div>';
+      const _modeLabel = IS_DELISTED_MODE ? '下架物品批量取消订阅' : '批量取消订阅';
+      progressDiv.innerHTML = '<div style="font-weight:bold;margin-bottom:8px;">🔄 ' + _modeLabel + '中...</div><div id="progress-text">初始化...</div>';
       document.body.appendChild(progressDiv);
     } catch(e) {
       console.warn('无法创建进度显示:', e);
@@ -809,6 +909,9 @@
       mo.observe(D.documentElement||D.body, {childList:true, subtree:true});
     });
   }
+
+  // 非 bulk_unsub 模式：仅保留手动菜单能力，不自动跑队列/检测接口，避免无意义请求。
+  if (!IS_BULK_UNSUB) return;
 
   // 初始化：检测模式
   console.log('[初始化] 检测运行模式...');
