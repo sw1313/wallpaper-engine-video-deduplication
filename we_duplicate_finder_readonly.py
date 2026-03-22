@@ -13,25 +13,30 @@ Wallpaper Engine (431960) 重复视频检测
 现在的“重复判定”逻辑（与原版不同）：
   1. 先按“时长分桶 +（可选）音频指纹”做粗分桶；
   2. 在同一个粗桶内，使用 phash_parts 做模糊匹配：
-     - 计算任意两个文件的 pHash 平均汉明距离；
-     - 若距离 <= 配置 phash_distance_threshold（默认 8），就 union 成同一组；
-     - 最终把每个 union-find 结果当成一组候选重复。
+     - 逐帧汉明距离归一化到 64 位基准
+     - 组合分数 = 截尾均值 / (1 + 标准差)
+     - 同内容不同分辨率：高标准差→分数低→容易匹配
+     - 不同内容同模板：低标准差→分数不被压低→不易误匹配
+     - 若分数 <= phash_distance_threshold（默认 1.0），就 union 成同一组
 """
 
 import argparse
 import contextlib
 import csv
 import hashlib
+import io
 import logging
 import math
 import os
 import re
 import shlex
+import sqlite3
 import subprocess
 import sys
 import tempfile
 import time
 import uuid
+import json
 from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -75,7 +80,7 @@ class Config:
     require_both_signatures: bool = True
 
     # —— pHash 模糊匹配参数 ——
-    phash_distance_threshold: float = 8.0  # NEW: pHash 平均汉明距离阈值（越小越严格）
+    phash_distance_threshold: float = 0.6  # 组合距离分阈值（截尾均值/(1+标准差)），越小越严格
 
     # —— 并行与超时 ——
     max_workers_stage1: int = 8         # 阶段1（测时长）线程数
@@ -116,17 +121,228 @@ LOGGER = logging.getLogger("we_dup")
 
 # ----------------------------- 日志 -----------------------------
 
-def setup_logging(level=logging.INFO, log_file: Optional[str]=None):
+def _utf8_stdout():
+    """返回以 UTF-8 输出的流，避免 Windows 下文件名含 emoji 等字符时 gbk 编码报错。"""
+    if hasattr(sys.stdout, "buffer"):
+        return io.TextIOWrapper(
+            sys.stdout.buffer, encoding="utf-8", errors="replace", line_buffering=True
+        )
+    return sys.stdout
+
+
+def setup_logging(level=logging.INFO, log_file: Optional[str] = None, file_mode: str = "a"):
+    # 重要：先 close 旧 handler，避免 Windows 上文件句柄一直占用
+    for h in list(LOGGER.handlers):
+        try:
+            h.close()
+        except Exception:
+            pass
     LOGGER.handlers.clear()
     fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
-    h = logging.StreamHandler(sys.stdout)
+    h = logging.StreamHandler(_utf8_stdout())
     h.setFormatter(fmt)
     LOGGER.addHandler(h)
     if log_file:
-        fh = logging.FileHandler(log_file, encoding="utf-8")
+        fh = logging.FileHandler(log_file, encoding="utf-8", mode=file_mode)
         fh.setFormatter(fmt)
         LOGGER.addHandler(fh)
     LOGGER.setLevel(level)
+
+# ----------------------------- 断点续跑缓存（sqlite） -----------------------------
+
+def _cfg_visual_hash(cfg: "Config") -> str:
+    data = {
+        "sample_frames": int(cfg.sample_frames),
+        "phash_size": int(cfg.phash_size),
+        "video_window_seconds": float(cfg.video_window_seconds),
+        "seek_ratio": float(cfg.seek_ratio),
+    }
+    return hashlib.sha1(json.dumps(data, sort_keys=True).encode("utf-8")).hexdigest()
+
+
+def _cfg_audio_hash(cfg: "Config") -> str:
+    data = {
+        "audio_window_seconds": int(cfg.audio_window_seconds),
+        "seek_ratio": float(cfg.seek_ratio),
+        "fpcalc_path": str(cfg.fpcalc_path),
+        "ffmpeg_path": str(cfg.ffmpeg_path),
+    }
+    return hashlib.sha1(json.dumps(data, sort_keys=True).encode("utf-8")).hexdigest()
+
+
+class SigCache:
+    """
+    sqlite 缓存：
+    - duration：按文件 path+size+mtime_ns 缓存（跨运行复用）
+    - signatures：视觉签名按 visual_cfg_hash；音频签名按 audio_cfg_hash
+    """
+
+    def __init__(self, db_path: Path):
+        self.db_path = db_path
+        self.lock = Lock()
+        self._write_count = 0
+        self._checkpoint_interval = 50
+        self.conn = sqlite3.connect(str(db_path), timeout=30, check_same_thread=False)
+        self.conn.execute("PRAGMA journal_mode=WAL;")
+        self.conn.execute("PRAGMA synchronous=FULL;")
+        with self.conn:
+            self.conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS file_cache (
+                  path TEXT PRIMARY KEY,
+                  size INTEGER NOT NULL,
+                  mtime_ns INTEGER NOT NULL,
+                  item_id TEXT,
+                  url TEXT,
+                  duration REAL,
+                  phash_digest TEXT,
+                  phash_parts_json TEXT,
+                  visual_cfg_hash TEXT,
+                  audio_fp_digest TEXT,
+                  audio_cfg_hash TEXT,
+                  color_histogram_json TEXT,
+                  updated_ts INTEGER
+                );
+                """
+            )
+
+    def _maybe_checkpoint(self):
+        self._write_count += 1
+        if self._write_count % self._checkpoint_interval == 0:
+            try:
+                self.conn.execute("PRAGMA wal_checkpoint(PASSIVE);")
+            except Exception:
+                pass
+
+    def close(self):
+        try:
+            self.conn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
+        except Exception:
+            pass
+        try:
+            self.conn.close()
+        except Exception:
+            pass
+
+    @staticmethod
+    def _key(p: Path) -> str:
+        try:
+            return str(p.resolve())
+        except Exception:
+            return str(p)
+
+    def delete_path(self, p: Path) -> None:
+        """删除已不存在文件在缓存中的记录，避免库持续膨胀。"""
+        key = self._key(p)
+        with self.lock, self.conn:
+            self.conn.execute("DELETE FROM file_cache WHERE path=?", (key,))
+
+    def prune_missing(self) -> int:
+        """删除缓存中路径已不存在的记录，返回删除条数。启动时调用一次，避免已删文件参与筛重。"""
+        with self.lock:
+            cur = self.conn.execute("SELECT path FROM file_cache")
+            rows = cur.fetchall()
+        deleted = 0
+        for (key,) in rows:
+            try:
+                if not Path(key).exists():
+                    with self.lock, self.conn:
+                        self.conn.execute("DELETE FROM file_cache WHERE path=?", (key,))
+                    deleted += 1
+            except Exception:
+                pass
+        return deleted
+
+    def get_row(self, p: Path, size: int, mtime_ns: int) -> Optional[Dict[str, object]]:
+        key = self._key(p)
+        with self.lock:
+            cur = self.conn.execute(
+                "SELECT size,mtime_ns,item_id,url,duration,phash_digest,phash_parts_json,visual_cfg_hash,audio_fp_digest,audio_cfg_hash,color_histogram_json "
+                "FROM file_cache WHERE path=?",
+                (key,),
+            )
+            row = cur.fetchone()
+        if not row:
+            return None
+        if int(row[0]) != int(size) or int(row[1]) != int(mtime_ns):
+            return None
+        return {
+            "item_id": row[2],
+            "url": row[3],
+            "duration": row[4],
+            "phash_digest": row[5],
+            "phash_parts_json": row[6],
+            "visual_cfg_hash": row[7],
+            "audio_fp_digest": row[8],
+            "audio_cfg_hash": row[9],
+            "color_histogram_json": row[10],
+        }
+
+    def upsert_duration(self, p: Path, size: int, mtime_ns: int, item_id: str, url: str, duration: Optional[float]):
+        key = self._key(p)
+        with self.lock, self.conn:
+            self.conn.execute(
+                """
+                INSERT INTO file_cache(path,size,mtime_ns,item_id,url,duration,updated_ts)
+                VALUES(?,?,?,?,?,?,?)
+                ON CONFLICT(path) DO UPDATE SET
+                  size=excluded.size,
+                  mtime_ns=excluded.mtime_ns,
+                  item_id=excluded.item_id,
+                  url=excluded.url,
+                  duration=excluded.duration,
+                  updated_ts=excluded.updated_ts
+                """,
+                (key, int(size), int(mtime_ns), item_id, url, duration, int(time.time())),
+            )
+        self._maybe_checkpoint()
+
+    def upsert_visual(self, p: Path, size: int, mtime_ns: int, item_id: str, url: str,
+                      phash_digest: Optional[str], phash_parts: List[str], visual_cfg_hash: str):
+        key = self._key(p)
+        parts_json = json.dumps(phash_parts, ensure_ascii=False)
+        with self.lock, self.conn:
+            self.conn.execute(
+                """
+                INSERT INTO file_cache(path,size,mtime_ns,item_id,url,phash_digest,phash_parts_json,visual_cfg_hash,updated_ts)
+                VALUES(?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(path) DO UPDATE SET
+                  size=excluded.size,
+                  mtime_ns=excluded.mtime_ns,
+                  item_id=excluded.item_id,
+                  url=excluded.url,
+                  phash_digest=excluded.phash_digest,
+                  phash_parts_json=excluded.phash_parts_json,
+                  visual_cfg_hash=excluded.visual_cfg_hash,
+                  updated_ts=excluded.updated_ts
+                """,
+                (key, int(size), int(mtime_ns), item_id, url, phash_digest, parts_json, visual_cfg_hash, int(time.time())),
+            )
+        self._maybe_checkpoint()
+
+    def upsert_audio(self, p: Path, size: int, mtime_ns: int, item_id: str, url: str,
+                     audio_fp_digest: Optional[str], audio_cfg_hash: str):
+        key = self._key(p)
+        with self.lock, self.conn:
+            self.conn.execute(
+                """
+                INSERT INTO file_cache(path,size,mtime_ns,item_id,url,audio_fp_digest,audio_cfg_hash,updated_ts)
+                VALUES(?,?,?,?,?,?,?,?)
+                ON CONFLICT(path) DO UPDATE SET
+                  size=excluded.size,
+                  mtime_ns=excluded.mtime_ns,
+                  item_id=excluded.item_id,
+                  url=excluded.url,
+                  audio_fp_digest=excluded.audio_fp_digest,
+                  audio_cfg_hash=excluded.audio_cfg_hash,
+                  updated_ts=excluded.updated_ts
+                """,
+                (key, int(size), int(mtime_ns), item_id, url, audio_fp_digest, audio_cfg_hash, int(time.time())),
+            )
+        self._maybe_checkpoint()
+
+
+_CACHE: Optional[SigCache] = None
 
 # ----------------------------- 通用工具 -----------------------------
 
@@ -180,9 +396,14 @@ def run_cmd(cmd: List[str], timeout: int, trace=False) -> Tuple[int, bytes, byte
 def nearest_bucket(d: Optional[float], mode: str) -> Optional[str]:
     if d is None:
         return None
-    if mode == "nearest_0.5":
+    m = (mode or "").strip().lower()
+    if m in {"nearest_0.5", "0.5", "half"}:
         b = round(d * 2) / 2.0
     else:
+        # 兼容历史写法：
+        # - "int"：整数
+        # - "nearest_1.0"：最接近 1 秒（等价于整数）
+        # - 其他/空：回退到整数
         b = int(round(d))
     return str(b)
 
@@ -242,7 +463,13 @@ def ffmpeg_extract_small_gray_frames_middle(ffmpeg_path: str, video: Path, frame
                                             duration: Optional[float],
                                             window_seconds: float,
                                             seek_ratio: float) -> List[np.ndarray]:
-    """在“中间窗口”内提取最多 N 张 64x64 灰度帧：先 I 帧，不足再均匀采样；必要时放宽窗口。"""
+    """
+    在“中间窗口”内提取最多 N 张 64x64 灰度帧。
+
+    重要：为了跨编码/跨分辨率的稳定性，这里**优先使用基于时间轴的均匀采样（fps=...）**，
+    而不是优先 I 帧。原因是 I 帧位置强依赖编码器/GOP 设置，不同转码版本会抽到不同时间点，
+    对“运动多/细节多”的 3D 视频（如 Blender 输出）会导致 pHash 大幅漂移，即使内容完全一致。
+    """
     def run_and_collect(vf: str, limit: int, start_s: float, win_s: float) -> List[np.ndarray]:
         cmd = [
             ffmpeg_path, "-hide_banner", "-v", "error", "-nostdin",
@@ -269,12 +496,13 @@ def ffmpeg_extract_small_gray_frames_middle(ffmpeg_path: str, video: Path, frame
     win = window_seconds if duration is None else min(window_seconds, duration)
     start = middle_window_start(duration, win, seek_ratio)
 
-    frames1 = run_and_collect("select='eq(pict_type\\,I)',scale=64:64,format=gray", frames, start, win)
+    fps = max(1.0, min(15.0, frames / max(1.0, win)))
+    frames1 = run_and_collect(f"fps={fps},scale=64:64,format=gray", frames, start, win)
     if frames1:
         return frames1
 
-    fps = max(1.0, min(15.0, frames / max(1.0, win)))
-    frames2 = run_and_collect(f"fps={fps},scale=64:64,format=gray", frames, start, win)
+    # 兜底：fps 抽帧失败时再尝试 I 帧（某些坏文件 fps 可能拿不到任何帧）
+    frames2 = run_and_collect("select='eq(pict_type\\,I)',scale=64:64,format=gray", frames, start, win)
     if frames2:
         return frames2
 
@@ -282,11 +510,12 @@ def ffmpeg_extract_small_gray_frames_middle(ffmpeg_path: str, video: Path, frame
     if duration and win < min(duration, 60.0):
         win2 = min(duration, min(60.0, win * 2.0))
         start2 = middle_window_start(duration, win2, seek_ratio)
-        frames3 = run_and_collect("select='eq(pict_type\\,I)',scale=64:64,format=gray", frames, start2, win2)
+        fps2 = max(1.0, min(15.0, frames / max(1.0, win2)))
+        frames3 = run_and_collect(f"fps={fps2},scale=64:64,format=gray", frames, start2, win2)
         if frames3:
             return frames3
-        fps2 = max(1.0, min(15.0, frames / max(1.0, win2)))
-        frames4 = run_and_collect(f"fps={fps2},scale=64:64,format=gray", frames, start2, win2)
+
+        frames4 = run_and_collect("select='eq(pict_type\\,I)',scale=64:64,format=gray", frames, start2, win2)
         if frames4:
             return frames4
 
@@ -363,6 +592,8 @@ def fpcalc_fingerprint_middle(fpcalc_path: str, ffmpeg_path: str, video: Path,
             return dig, None
         return None, f"fpcalc on wav failed: {reason}"
 
+
+
 # ----------------------------- 扫描 -----------------------------
 
 def find_items(workshop_root: Path) -> Dict[str, List[Path]]:
@@ -385,14 +616,46 @@ def find_items(workshop_root: Path) -> Dict[str, List[Path]]:
 
 def measure_duration_one(item_id: str, vp: Path, cfg: Config) -> DurationRec:
     url = make_we_url(item_id)
+    if not vp.exists():
+        LOGGER.debug("[skip] 文件已删除，不参与筛重：%s", vp)
+        if _CACHE:
+            try:
+                _CACHE.delete_path(vp)
+            except Exception:
+                pass
+        return DurationRec(item_id=item_id, path=vp, size=0, duration=None, bucket=None, url=url)
     try:
-        size = vp.stat().st_size
+        st = vp.stat()
+        size = st.st_size
+        mtime_ns = getattr(st, "st_mtime_ns", int(st.st_mtime * 1e9))
     except Exception:
         size = 0
+        mtime_ns = 0
+
+    # 断点续跑：优先用缓存的 duration（仅当文件仍存在且未变），bucket 每次按当前配置重算
+    if _CACHE and size and mtime_ns:
+        row = _CACHE.get_row(vp, size, mtime_ns)
+        if row and row.get("duration") is not None:
+            if vp.exists():
+                try:
+                    st2 = vp.stat()
+                    if st2.st_size == size and getattr(st2, "st_mtime_ns", int(st2.st_mtime * 1e9)) == mtime_ns:
+                        dur = float(row["duration"]) if row["duration"] is not None else None
+                        bucket = nearest_bucket(dur, cfg.duration_rounding)
+                        return DurationRec(item_id=item_id, path=vp, size=size, duration=dur, bucket=bucket, url=url)
+                except Exception:
+                    pass
+
     dur = ffprobe_duration(cfg.ffprobe_path, vp, cfg.ffprobe_timeout, cfg.trace)
     bucket = nearest_bucket(dur, cfg.duration_rounding)
     if dur is None:
         LOGGER.warning("[dur] %s (%s) 时长获取失败", item_id, vp.name)
+
+    if _CACHE and size and mtime_ns:
+        try:
+            _CACHE.upsert_duration(vp, size, mtime_ns, item_id, url, dur)
+        except Exception as e:
+            LOGGER.debug("[cache] upsert_duration failed: %s", e)
     return DurationRec(item_id=item_id, path=vp, size=size, duration=dur, bucket=bucket, url=url)
 
 def stage1_measure_and_bucket(items_map: Dict[str, List[Path]], cfg: Config) -> Dict[str, List[DurationRec]]:
@@ -434,8 +697,59 @@ def stage1_measure_and_bucket(items_map: Dict[str, List[Path]], cfg: Config) -> 
 
 def sign_one(rec: DurationRec, cfg: Config) -> FileSig:
     """对单文件计算 pHash +（可选）音频指纹（均在中段窗口）。"""
+    if not rec.path.exists():
+        LOGGER.debug("[skip] 文件已删除，不参与筛重：%s", rec.path)
+        if _CACHE:
+            try:
+                _CACHE.delete_path(rec.path)
+            except Exception:
+                pass
+        return FileSig(
+            item_id=rec.item_id, path=rec.path, size=rec.size,
+            duration=rec.duration, duration_bucket=rec.bucket,
+            phash_digest=None, phash_parts=[], audio_fp_digest=None, url=rec.url,
+            errors=["file_deleted"],
+        )
     prefix = f"[{rec.item_id}]({rec.path.name})"
     LOGGER.info("%s 签名开始：%s (%.2f MiB)", prefix, str(rec.path), rec.size/1024/1024)
+
+    # 尝试走缓存（仅当文件仍存在；视觉/音频按各自 cfg hash 命中）
+    st = None
+    try:
+        st = rec.path.stat()
+        mtime_ns = getattr(st, "st_mtime_ns", int(st.st_mtime * 1e9))
+    except Exception:
+        mtime_ns = 0
+
+    visual_hash = _cfg_visual_hash(cfg)
+    audio_hash = _cfg_audio_hash(cfg)
+    cached_phash_digest = None
+    cached_phash_parts: List[str] = []
+    cached_audio = None
+
+    if _CACHE and rec.size and mtime_ns and rec.path.exists():
+        row = _CACHE.get_row(rec.path, rec.size, mtime_ns)
+        if row:
+            if row.get("visual_cfg_hash") == visual_hash and row.get("phash_digest") and row.get("phash_parts_json"):
+                cached_phash_digest = str(row.get("phash_digest") or "")
+                try:
+                    cached_phash_parts = json.loads(str(row.get("phash_parts_json") or "[]")) or []
+                except Exception:
+                    cached_phash_parts = []
+            if row.get("audio_cfg_hash") == audio_hash and row.get("audio_fp_digest"):
+                cached_audio = str(row.get("audio_fp_digest") or "")
+
+    if cached_phash_digest and cached_phash_parts and (not cfg.require_both_signatures or cached_audio):
+        if rec.path.exists():
+            fs = FileSig(
+                item_id=rec.item_id, path=rec.path, size=rec.size,
+                duration=rec.duration, duration_bucket=rec.bucket,
+                phash_digest=cached_phash_digest, phash_parts=cached_phash_parts,
+                audio_fp_digest=cached_audio, url=rec.url
+            )
+            LOGGER.info("%s 命中缓存，跳过签名计算", prefix)
+            LOGGER.info("%s 签名完成", prefix)
+            return fs
 
     # pHash（中段窗口）
     phash_digest = None
@@ -451,6 +765,12 @@ def sign_one(rec: DurationRec, cfg: Config) -> FileSig:
         if not phash_digest:
             LOGGER.warning("%s pHash 计算失败", prefix)
 
+    if _CACHE and rec.size and mtime_ns and phash_parts:
+        try:
+            _CACHE.upsert_visual(rec.path, rec.size, mtime_ns, rec.item_id, rec.url, phash_digest, phash_parts, visual_hash)
+        except Exception as e:
+            LOGGER.debug("[cache] upsert_visual failed: %s", e)
+
     # 音频指纹（中段窗口；严格模式下才做）
     audio_digest = None
     reason = None
@@ -465,6 +785,11 @@ def sign_one(rec: DurationRec, cfg: Config) -> FileSig:
         audio_digest, reason = ad, rsn
         if not audio_digest:
             LOGGER.warning("%s 音频指纹获取失败（%s）", prefix, reason)
+        if _CACHE and rec.size and mtime_ns:
+            try:
+                _CACHE.upsert_audio(rec.path, rec.size, mtime_ns, rec.item_id, rec.url, audio_digest, audio_hash)
+            except Exception as e:
+                LOGGER.debug("[cache] upsert_audio failed: %s", e)
 
     fs = FileSig(
         item_id=rec.item_id, path=rec.path, size=rec.size,
@@ -601,10 +926,19 @@ def _hex_to_hash_cached(h: str) -> imagehash.ImageHash:
 
 def phash_distance(fs1: FileSig, fs2: FileSig) -> float:
     """
-    计算两个文件的“平均 pHash 汉明距离”：
-      - 取两者 phash_parts 的 min(len1, len2) 个
-      - 对应位置两两计算汉明距离，取平均值
+    组合分数 = 截尾均值 / (1 + 标准差)，附带截尾均值上限保护。
+
+    - 逐帧距离归一化到 8x8（64 位）基准
+    - 截尾均值：去掉最高 10%，降低编码差异产生的异常帧影响
+    - 截尾均值上限（_TM_CAP=4.0）：如果截尾均值本身就很高，
+      说明"大部分帧都有明显差异"，此时即使标准差高也不应匹配
+      （防止"一半帧相同、一半帧不同"的换装/换角色视频被误判）
+    - 除以 (1 + std)：对截尾均值较低的情况，
+      同内容不同编码→高 std→分数更低→更容易匹配
     """
+    _BASELINE_BITS = 64.0
+    _TM_CAP = 4.0
+
     p1 = fs1.phash_parts
     p2 = fs2.phash_parts
     if not p1 or not p2:
@@ -613,16 +947,38 @@ def phash_distance(fs1: FileSig, fs2: FileSig) -> float:
     if n == 0:
         return float("inf")
 
-    total = 0.0
+    dists: List[float] = []
     for i in range(n):
         try:
             h1 = _hex_to_hash_cached(p1[i])
             h2 = _hex_to_hash_cached(p2[i])
-            total += (h1 - h2)  # imagehash.ImageHash 的“-”运算符返回汉明距离
+            raw_d = h1 - h2
+            bits = h1.hash.size
+            norm_d = raw_d * _BASELINE_BITS / max(bits, 1)
+            dists.append(norm_d)
         except Exception as e:
             LOGGER.debug("[phash_distance] 计算失败：%s", e)
             return float("inf")
-    return total / float(n)
+
+    dists.sort()
+    trim = max(1, n // 10)
+    trimmed = dists[: n - trim]
+    if not trimmed:
+        return float("inf")
+    tm = sum(trimmed) / len(trimmed)
+
+    if tm > _TM_CAP:
+        return float("inf")
+
+    if n < 6:
+        return tm
+
+    mean_all = sum(dists) / n
+    variance = sum((d - mean_all) ** 2 for d in dists) / (n - 1)
+    std = math.sqrt(variance)
+
+    return tm / (1.0 + std)
+
 
 def cluster_bucket_by_phash(fs_list: List[FileSig], threshold: float) -> List[List[FileSig]]:
     """
@@ -726,7 +1082,7 @@ def load_config(path: Optional[Path]) -> Config:
         duration_rounding = get("duration_rounding", "int"),
         require_both_signatures = bool(get("require_both_signatures", True)),
 
-        phash_distance_threshold = float(get("phash_distance_threshold", 8.0)),
+        phash_distance_threshold = float(get("phash_distance_threshold", 0.6)),
 
         max_workers_stage1 = int(get("max_workers_stage1", 8)),
         max_workers_stage2 = int(get("max_workers_stage2", 6)),
@@ -753,99 +1109,175 @@ def main():
     if args.no_progress:
         cfg.progress = False
 
-    setup_logging(logging.DEBUG if cfg.verbose else logging.INFO, cfg.log_file)
+    # 空字符串视为不写日志文件
+    if cfg.log_file is not None and str(cfg.log_file).strip() == "":
+        cfg.log_file = None
 
-    LOGGER.info("[CFG] phash_distance_threshold=%.2f（数值越小越严格）", cfg.phash_distance_threshold)
-
+    # 输出目录先创建，用来放 state/cache
     root = Path(cfg.workshop_root).resolve()
     out_dir = Path(cfg.output_dir).resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    LOGGER.info("[INFO] Scanning workshop: %s", root)
-    items_map = find_items(root)
-    LOGGER.info("[INFO] Found %d items with candidate video files", len(items_map))
+    # 运行状态：决定 log 文件是重建还是追加
+    state_path = out_dir / "we_dedup_state.json"
+    prev_status = None
+    if state_path.exists():
+        try:
+            prev = json.loads(state_path.read_text(encoding="utf-8"))
+            prev_status = prev.get("status")
+        except Exception:
+            prev_status = None
+    file_mode = "w" if prev_status == "completed" else "a"
 
-    # 新主流程：阶段1 + 阶段2 管线并行
-    filesigs = stage1_and_stage2_pipelined(items_map, cfg)
+    setup_logging(logging.DEBUG if cfg.verbose else logging.INFO, cfg.log_file, file_mode=file_mode)
 
-    # 过滤可参与最终分组的文件
-    eligible: List[FileSig] = []
-    for fs in filesigs:
-        if cfg.require_both_signatures:
-            if fs.duration_bucket and fs.phash_parts and fs.audio_fp_digest:
-                eligible.append(fs)
-        else:
-            if fs.duration_bucket and fs.phash_parts:
-                eligible.append(fs)
-    LOGGER.info("[INFO] 可参与最终分组的文件：%d / %d（候选）", len(eligible), len(filesigs))
+    # 初始化缓存：记住每个文件的时长/视觉/音频特征，再次跑只计算新文件，用缓存参与比对
+    global _CACHE
+    try:
+        _CACHE = SigCache(out_dir / "we_dedup_cache.sqlite3")
+        pruned = _CACHE.prune_missing()
+        if pruned:
+            LOGGER.info("[cache] 已清理 %d 条已删除文件的缓存记录，这些文件将不参与筛重。", pruned)
+        LOGGER.info("[cache] 特征值缓存已加载，已计算过的文件将直接使用缓存，仅对新文件计算特征值并参与比对。")
+    except Exception as e:
+        _CACHE = None
+        LOGGER.warning("[cache] 初始化失败（将不启用断点续跑）：%s", e)
 
-    if not eligible:
-        LOGGER.info("[INFO] 无可用签名文件，结束。")
-        return
+    # 写入 running 状态（如果异常退出，下次会自动当作未完成并续跑）
+    try:
+        state_path.write_text(json.dumps({
+            "status": "running",
+            "start_ts": int(time.time()),
+            "pid": os.getpid(),
+            "log_file": cfg.log_file,
+            "log_mode": file_mode,
+        }, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception:
+        pass
 
-    # 粗分桶：按“时长分桶 +（可选）音频指纹”
-    def bucket_key(fs: FileSig):
-        if cfg.require_both_signatures:
-            return (fs.duration_bucket, fs.audio_fp_digest)
-        else:
-            return (fs.duration_bucket,)
+    LOGGER.info("[CFG] phash_distance_threshold=%.2f（数值越小越严格）", cfg.phash_distance_threshold)
 
-    bucket_groups: Dict[Tuple, List[FileSig]] = defaultdict(list)
-    for fs in eligible:
-        bucket_groups[bucket_key(fs)].append(fs)
+    exit_code = 0
+    try:
+        LOGGER.info("[INFO] Scanning workshop: %s", root)
+        items_map = find_items(root)
+        LOGGER.info("[INFO] Found %d items with candidate video files", len(items_map))
 
-    LOGGER.info(
-        "[INFO] 粗分桶数量：%d（按时长%s）",
-        len(bucket_groups),
-        "+音频" if cfg.require_both_signatures else ""
-    )
+        # 新主流程：阶段1 + 阶段2 管线并行（带缓存自动跳过）
+        filesigs = stage1_and_stage2_pipelined(items_map, cfg)
 
-    # 在每个粗桶内用 phash_parts 做模糊聚类
-    all_duplicate_groups: List[List[FileSig]] = []
-    for bkey, flist in bucket_groups.items():
-        if len(flist) < 2:
-            continue
-        clusters = cluster_bucket_by_phash(flist, cfg.phash_distance_threshold)
-        if not clusters:
-            continue
-        all_duplicate_groups.extend(clusters)
-        LOGGER.info("[dup-bucket] 粗桶 %s 内 fuzzy 子组数=%d", bkey, len(clusters))
+        # 过滤可参与最终分组的文件
+        eligible: List[FileSig] = []
+        for fs in filesigs:
+            if cfg.require_both_signatures:
+                if fs.duration_bucket and fs.phash_parts and fs.audio_fp_digest:
+                    eligible.append(fs)
+            else:
+                if fs.duration_bucket and fs.phash_parts:
+                    eligible.append(fs)
+        LOGGER.info("[INFO] 可参与最终分组的文件：%d / %d（候选）", len(eligible), len(filesigs))
 
-    # 组织导出：对每个 fuzzy 组，合并到“不同 item”，并按该 item 命中的最大文件大小降序
-    duplicate_groups_urls: List[List[str]] = []
-    kept_groups = 0
-    for group in all_duplicate_groups:
-        item_to_bestsize: Dict[str, int] = {}
-        item_to_url: Dict[str, str] = {}
-        for fs in group:
-            if fs.item_id not in item_to_bestsize or fs.size > item_to_bestsize[fs.item_id]:
-                item_to_bestsize[fs.item_id] = fs.size
-                item_to_url[fs.item_id] = fs.url
-        if len(item_to_bestsize) <= 1:
-            continue
-        ordered = sorted(item_to_bestsize.items(), key=lambda kv: kv[1], reverse=True)
-        urls = [item_to_url[iid] for iid, _ in ordered]
-        duplicate_groups_urls.append(urls)
-        kept_groups += 1
+        if not eligible:
+            LOGGER.info("[INFO] 无可用签名文件，结束。")
+            return
+
+        # 粗分桶：按“时长分桶 +（可选）音频指纹”
+        def bucket_key(fs: FileSig):
+            if cfg.require_both_signatures:
+                return (fs.duration_bucket, fs.audio_fp_digest)
+            else:
+                return (fs.duration_bucket,)
+
+        bucket_groups: Dict[Tuple, List[FileSig]] = defaultdict(list)
+        for fs in eligible:
+            bucket_groups[bucket_key(fs)].append(fs)
+
         LOGGER.info(
-            "[dup] fuzzy 组 #%d → items=%s",
-            kept_groups,
-            [u.rsplit('=', 1)[-1] for u in urls]
+            "[INFO] 粗分桶数量：%d（按时长%s）",
+            len(bucket_groups),
+            "+音频" if cfg.require_both_signatures else ""
         )
 
-    # 导出
-    ts = time.strftime("%Y%m%d_%H%M%S")
-    out_csv = out_dir / f"duplicates_{ts}.csv"
-    out_xlsx = out_dir / f"duplicates_{ts}.xlsx"
-    if duplicate_groups_urls:
-        export_csv(duplicate_groups_urls, out_csv)
-        export_xlsx(duplicate_groups_urls, out_xlsx)
-        LOGGER.info("[OUT] CSV : %s", out_csv)
-        LOGGER.info("[OUT] XLSX: %s", out_xlsx)
-    else:
-        LOGGER.info("[INFO] 未发现重复组（在当前 fuzzy 条件下）")
+        # 在每个粗桶内用 phash_parts 做模糊聚类
+        all_duplicate_groups: List[List[FileSig]] = []
+        for bkey, flist in bucket_groups.items():
+            if len(flist) < 2:
+                continue
+            clusters = cluster_bucket_by_phash(flist, cfg.phash_distance_threshold)
+            if not clusters:
+                continue
+            all_duplicate_groups.extend(clusters)
+            LOGGER.info("[dup-bucket] 粗桶 %s 内 fuzzy 子组数=%d", bkey, len(clusters))
 
-    LOGGER.info("[DONE] 任务完成，重复组数：%d", kept_groups)
+        # 组织导出：对每个 fuzzy 组，合并到“不同 item”，并按该 item 命中的最大文件大小降序
+        duplicate_groups_urls: List[List[str]] = []
+        kept_groups = 0
+        for group in all_duplicate_groups:
+            item_to_bestsize: Dict[str, int] = {}
+            item_to_url: Dict[str, str] = {}
+            for fs in group:
+                if fs.item_id not in item_to_bestsize or fs.size > item_to_bestsize[fs.item_id]:
+                    item_to_bestsize[fs.item_id] = fs.size
+                    item_to_url[fs.item_id] = fs.url
+            if len(item_to_bestsize) <= 1:
+                continue
+            ordered = sorted(item_to_bestsize.items(), key=lambda kv: kv[1], reverse=True)
+            urls = [item_to_url[iid] for iid, _ in ordered]
+            duplicate_groups_urls.append(urls)
+            kept_groups += 1
+            LOGGER.info(
+                "[dup] fuzzy 组 #%d → items=%s",
+                kept_groups,
+                [u.rsplit('=', 1)[-1] for u in urls]
+            )
+
+        # 导出
+        ts = time.strftime("%Y%m%d_%H%M%S")
+        out_csv = out_dir / f"duplicates_{ts}.csv"
+        out_xlsx = out_dir / f"duplicates_{ts}.xlsx"
+        if duplicate_groups_urls:
+            export_csv(duplicate_groups_urls, out_csv)
+            export_xlsx(duplicate_groups_urls, out_xlsx)
+            LOGGER.info("[OUT] CSV : %s", out_csv)
+            LOGGER.info("[OUT] XLSX: %s", out_xlsx)
+        else:
+            LOGGER.info("[INFO] 未发现重复组（在当前 fuzzy 条件下）")
+
+        LOGGER.info("[DONE] 任务完成，重复组数：%d", kept_groups)
+    except KeyboardInterrupt:
+        exit_code = 130
+        LOGGER.warning("[EXIT] 用户中断（下次将从未完成部分继续）")
+    except Exception as e:
+        exit_code = 1
+        LOGGER.exception("[EXIT] 异常退出（下次将从未完成部分继续）：%s", e)
+    finally:
+        # 写入最终状态
+        try:
+            status = "completed" if exit_code == 0 else "incomplete"
+            state_path.write_text(json.dumps({
+                "status": status,
+                "end_ts": int(time.time()),
+                "pid": os.getpid(),
+                "exit_code": exit_code,
+                "log_file": cfg.log_file,
+            }, ensure_ascii=False, indent=2), encoding="utf-8")
+        except Exception:
+            pass
+        if _CACHE:
+            try:
+                _CACHE.close()
+            except Exception:
+                pass
+            _CACHE = None
+        # 关闭日志 handler，释放文件占用
+        for h in list(LOGGER.handlers):
+            try:
+                h.close()
+            except Exception:
+                pass
+
+    if exit_code != 0:
+        raise SystemExit(exit_code)
 
 if __name__ == "__main__":
     main()
