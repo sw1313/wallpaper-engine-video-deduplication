@@ -36,6 +36,12 @@ except Exception:  # pragma: no cover
 
 REPO_ROOT = Path(__file__).resolve().parent
 
+# 登录 Steam 后 /my/ 自动指向当前账号，无需配置个人资料 URL
+STEAM_MY_SUBS_UNSUB2 = (
+    "https://steamcommunity.com/my/myworkshopfiles"
+    "?browsesort=mysubscriptions&browsefilter=mysubscriptions&appid=431960&p=1#bulk_unsub=2"
+)
+
 
 def _is_windows() -> bool:
     return os.name == "nt"
@@ -308,11 +314,14 @@ class App(ttk.Frame):
 
         self.tab_dedup = ttk.Frame(self.nb)
         self.tab_unsub = ttk.Frame(self.nb)
+        self.tab_archive = ttk.Frame(self.nb)
         self.nb.add(self.tab_dedup, text="筛重 / 查重")
         self.nb.add(self.tab_unsub, text="取消订阅")
+        self.nb.add(self.tab_archive, text="下架归档")
 
         self._build_dedup_tab(self.tab_dedup)
         self._build_unsub_tab(self.tab_unsub)
+        self._build_archive_tab(self.tab_archive)
 
         # 默认加载根目录 config.toml
         self.dedup_config_path.set(str((REPO_ROOT / "config.toml").resolve()))
@@ -321,6 +330,7 @@ class App(ttk.Frame):
         # log pumps
         self.log_dedup.pump()
         self.log_unsub.pump()
+        self.log_archive.pump()
 
         # 关闭窗口时，确保把子进程杀干净（否则 log 文件会一直被占用）
         self.master.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -409,6 +419,7 @@ class App(ttk.Frame):
         try:
             self.log_dedup.close()
             self.log_unsub.close()
+            self.log_archive.close()
         except Exception:
             pass
         try:
@@ -419,7 +430,7 @@ class App(ttk.Frame):
     # ------------------- tabs -------------------
     def _on_tab_changed(self, _evt):
         idx = self.nb.index(self.nb.select())
-        self.current_tab = "dedup" if idx == 0 else "unsub"
+        self.current_tab = ("dedup", "unsub", "archive")[idx] if idx < 3 else "dedup"
 
     # ------------------- dedup tab -------------------
     def _build_dedup_tab(self, root: ttk.Frame):
@@ -600,6 +611,12 @@ class App(ttk.Frame):
                 vv = str(self._dedup_vars[key].get()).strip()
                 if vv:
                     self._dedup_vars[key].set(_which(vv))
+
+        # 下架归档 tab 也从同一 config 加载
+        if hasattr(self, "arc_we_install_dir"):
+            self.arc_we_install_dir.set(str(merged.get("we_install_dir", "")))
+        if hasattr(self, "arc_steam_api_key"):
+            self.arc_steam_api_key.set(str(merged.get("steam_api_key", "")))
 
     def _collect_dedup_config_dict(self) -> Dict[str, Any]:
         d: Dict[str, Any] = {}
@@ -787,6 +804,156 @@ class App(ttk.Frame):
             if url:
                 cmd += ["--single-page-url", url]
         self._start_process(cmd, cwd=REPO_ROOT / "output", sink=self.log_unsub)
+
+
+    # ------------------- archive tab -------------------
+    def _build_archive_tab(self, root: ttk.Frame):
+        root.rowconfigure(1, weight=1)
+        root.columnconfigure(0, weight=1)
+
+        frm = ttk.Frame(root)
+        frm.grid(row=0, column=0, sticky="ew", padx=8, pady=8)
+        frm.columnconfigure(1, weight=1)
+
+        self.arc_we_install_dir = tk.StringVar()
+        self.arc_steam_api_key = tk.StringVar()
+
+        ttk.Label(frm, text="WE 安装目录：").grid(row=0, column=0, sticky="w")
+        ttk.Entry(frm, textvariable=self.arc_we_install_dir).grid(row=0, column=1, sticky="ew", padx=(6, 6))
+        ttk.Button(frm, text="选择…", command=lambda: self._pick_dir(self.arc_we_install_dir)).grid(row=0, column=2)
+
+        ttk.Label(frm, text="Steam API Key（推荐）：").grid(row=1, column=0, sticky="w", pady=(6, 0))
+        ttk.Entry(frm, textvariable=self.arc_steam_api_key, show="*").grid(row=1, column=1, sticky="ew", padx=(6, 6), pady=(6, 0))
+        ttk.Button(frm, text="申请", command=lambda: __import__("webbrowser").open("https://steamcommunity.com/dev/apikey")).grid(row=1, column=2, pady=(6, 0))
+
+        note = ttk.Label(
+            frm,
+            text="提示：有 API Key 时使用 IPublishedFileService（检测更准确）；无 Key 回退到旧 API。取消订阅会打开 steamcommunity.com/my/…（已登录即当前账号）。",
+            foreground="#666666",
+            wraplength=700,
+        )
+        note.grid(row=2, column=0, columnspan=3, sticky="w", pady=(8, 0))
+
+        btns = ttk.Frame(frm)
+        btns.grid(row=3, column=0, columnspan=3, sticky="w", pady=(10, 0))
+        ttk.Button(btns, text="检测下架物品", command=self._run_arc_detect).grid(row=0, column=0, padx=(0, 8))
+        ttk.Button(btns, text="归档到本地", command=self._run_arc_archive).grid(row=0, column=1, padx=(0, 8))
+        ttk.Button(btns, text="取消订阅已下架", command=self._run_arc_unsub).grid(row=0, column=2, padx=(0, 8))
+        ttk.Button(btns, text="停止", command=self._stop_running).grid(row=0, column=3)
+
+        # log
+        logfrm = ttk.Frame(root)
+        logfrm.grid(row=1, column=0, sticky="nsew", padx=8, pady=(0, 8))
+        logfrm.rowconfigure(1, weight=1)
+        logfrm.columnconfigure(0, weight=1)
+        ttk.Label(logfrm, text="日志输出", font=("Microsoft YaHei UI", 10, "bold")).grid(row=0, column=0, sticky="w", pady=(0, 6))
+        txt = tk.Text(logfrm, wrap="word")
+        txt.grid(row=1, column=0, sticky="nsew")
+        self.log_archive = LogSink(txt)
+
+        # 从 config 加载初始值
+        defaults = load_toml(REPO_ROOT / "config.toml")
+        self.arc_we_install_dir.set(str(defaults.get("we_install_dir", "")))
+        self.arc_steam_api_key.set(str(defaults.get("steam_api_key", "")))
+
+    def _arc_get_config_path(self) -> Path:
+        return Path(self.dedup_config_path.get().strip() or str(REPO_ROOT / "config.toml"))
+
+    def _arc_workshop_root(self) -> str:
+        return str(self._dedup_vars.get("workshop_root", tk.StringVar(value="")).get()).strip()
+
+    def _run_arc_detect(self):
+        wr = self._arc_workshop_root()
+        if not wr:
+            messagebox.showerror("参数缺失", "请在「筛重」标签页填写 workshop_root。")
+            return
+
+        cfg_path = self._arc_get_config_path()
+        cmd = [
+            sys.executable,
+            str((REPO_ROOT / "we_delisted_archiver.py").resolve()),
+            "-c", str(cfg_path),
+            "--detect",
+            "--workshop-root", wr,
+        ]
+        api_key = self.arc_steam_api_key.get().strip()
+        if api_key:
+            cmd += ["--steam-api-key", api_key]
+        self._start_process(cmd, cwd=REPO_ROOT, sink=self.log_archive)
+
+    def _run_arc_archive(self):
+        we_dir = self.arc_we_install_dir.get().strip()
+        if not we_dir:
+            messagebox.showerror("参数缺失", "请填写 WE 安装目录。")
+            return
+        wr = self._arc_workshop_root()
+        if not wr:
+            messagebox.showerror("参数缺失", "请在「筛重」标签页填写 workshop_root。")
+            return
+
+        cfg_path = self._arc_get_config_path()
+        cmd = [
+            sys.executable,
+            str((REPO_ROOT / "we_delisted_archiver.py").resolve()),
+            "-c", str(cfg_path),
+            "--archive",
+            "--workshop-root", wr,
+            "--we-install-dir", we_dir,
+        ]
+        self._start_process(cmd, cwd=REPO_ROOT, sink=self.log_archive)
+
+    def _run_arc_unsub(self):
+        """生成 xlsx → 调用 bulk_unsub_controller.py 取消订阅已下架物品。"""
+        out_dir = Path(str(self._dedup_vars.get("output_dir", tk.StringVar(value="output")).get()).strip() or "output")
+        if not out_dir.is_absolute():
+            out_dir = (REPO_ROOT / out_dir).resolve()
+
+        delisted_path = out_dir / "delisted_items.json"
+        if not delisted_path.exists():
+            messagebox.showerror("未找到", f"请先运行「检测下架物品」\n{delisted_path}")
+            return
+
+        try:
+            with delisted_path.open("r", encoding="utf-8") as f:
+                data = json.load(f)
+            items = data.get("items", [])
+            if not items:
+                messagebox.showinfo("无需操作", "没有需要取消订阅的下架物品。")
+                return
+        except Exception as e:
+            messagebox.showerror("读取失败", str(e))
+            return
+
+        # 生成临时 xlsx
+        try:
+            from openpyxl import Workbook
+        except ImportError:
+            messagebox.showerror("缺少依赖", "需要 openpyxl: pip install openpyxl")
+            return
+
+        ts = time.strftime("%Y%m%d_%H%M%S")
+        xlsx_path = out_dir / f"delisted_unsub_{ts}.xlsx"
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "delisted"
+        ws.append(["url"])
+        for item in items:
+            ws.append([f"https://steamcommunity.com/sharedfiles/filedetails/?id={item['id']}"])
+        xlsx_path.parent.mkdir(parents=True, exist_ok=True)
+        wb.save(str(xlsx_path))
+
+        # 使用 /my/ 订阅页，浏览器已登录 Steam 时自动对应当前账号
+        cmd = [
+            sys.executable,
+            str((REPO_ROOT / "output" / "bulk_unsub_controller.py").resolve()),
+            "--xlsx", str(xlsx_path),
+            "--batch-size", "1",
+            "--single-page",
+            "--single-page-url", STEAM_MY_SUBS_UNSUB2,
+        ]
+
+        self.log_archive.write(f"[INFO] 已生成 {len(items)} 条取消订阅链接: {xlsx_path}\n")
+        self._start_process(cmd, cwd=REPO_ROOT / "output", sink=self.log_archive)
 
 
 def main():
