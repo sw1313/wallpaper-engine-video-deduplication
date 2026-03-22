@@ -41,8 +41,9 @@ UI 包含三个标签页：
 **下架归档** 标签页需填写：
 
 - **WE 安装目录**：含 `config.json` 的 Wallpaper Engine 根目录
-- **Steam 个人资料 URL**：用于打开「已订阅物品」页执行取消订阅
 - **Steam API Key（推荐）**：在 [Steam 开发者](https://steamcommunity.com/dev/apikey) 免费申请；有 Key 时使用 `IPublishedFileService` 检测，比无 Key 的旧接口更准确
+
+「取消订阅已下架」会打开 `https://steamcommunity.com/my/myworkshopfiles?...`（`/my/` 在已登录浏览器中自动对应当前账号，无需填写个人资料 URL）。
 
 建议流程：**检测下架物品** → **归档到本地**（复制 + 改 `config.json`）→ **取消订阅已下架**（浏览器 + 油猴，需已登录 Steam）。
 
@@ -83,7 +84,7 @@ cd output
 python bulk_unsub_controller.py --xlsx duplicates_xxx.xlsx --batch-size 1 --single-page
 ```
 
-下架物品取消订阅时，UI 会生成 `delisted_unsub_*.xlsx` 并打开带 `#bulk_unsub=2` 的订阅列表 URL（与 `#bulk_unsub=1` 行为一致，便于区分用途）。
+下架物品取消订阅时，UI 会生成 `delisted_unsub_*.xlsx` 并打开 `steamcommunity.com/my/myworkshopfiles?...#bulk_unsub=2`（与 `#bulk_unsub=1` 行为一致，便于区分用途）。
 
 > 如果网络不稳定导致取消订阅卡住，刷新浏览器标签页即可。
 
@@ -111,7 +112,6 @@ require_both_signatures = false  # true=同时要求视频+音频匹配
 
 # —— 下架归档 ——
 we_install_dir = "E:\\SteamLibrary\\steamapps\\common\\wallpaper_engine"
-steam_profile_url = "https://steamcommunity.com/profiles/你的SteamID64"
 steam_api_key = ""   # 推荐填写：https://steamcommunity.com/dev/apikey
 ```
 
