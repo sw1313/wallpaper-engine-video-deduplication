@@ -181,4 +181,3 @@ steam_api_key = ""   # 推荐填写：https://steamcommunity.com/dev/apikey
 ## 相关脚本说明
 
 - **`wallpaper-engine-video-deduplication.js`**：URL 含 `#bulk_unsub=1` 或 `#bulk_unsub=2` 时与 `bulk_unsub_controller.py` 配合，在浏览器内调用 Steam 取消订阅接口（使用当前登录 Cookie）。
-- **`取消收藏已下架的创意工坊物品-0.1.user.js`**：在订阅列表分页爬取并访问详情页判断下架；本仓库的 Python 检测以 API 为主，可与油猴流程互补。
