@@ -2,9 +2,9 @@
 
 Wallpaper Engine 创意工坊视频筛重 + 批量取消订阅 + **已下架物品检测与本地归档**。
 
-- **筛重**：抽关键帧 + 感知哈希 (pHash)，可选 chromaprint 音频指纹；默认**同时扫描创意工坊目录与** `projects/myprojects` **本地项目**，可发现跨订阅与本地的重复视频
+- **筛重**：抽关键帧 + 感知哈希 (pHash) + DINOv2/v3 patch 级空间裁决，可选 chromaprint 音频指纹；默认**同时扫描创意工坊目录与** `projects/myprojects` **本地项目**，可发现跨订阅与本地的重复视频；同大小时 myprojects 默认作为保留项
 - **取消订阅**：根据筛重结果批量取消订阅重复项，保留文件最大的版本
-- **下架归档**：检测创意工坊已下架/不可见物品，复制到 `projects/myprojects`，按原文件夹位置更新 `config.json`，并可批量取消订阅
+- **下架归档 / 按文件夹归档**：检测已下架/不可见物品 + 任意指定的 WE 文件夹，整批 `workshop → myprojects` 归档并同步 `config.json`，随后可一键批量取消订阅
 - **图形界面**：PySide6 (Qt 6) UI，参数可视化编辑，实时日志输出
 
 ## 环境准备
@@ -49,13 +49,24 @@ UI 包含三个标签页：
 |--------|------|
 | **筛重 / 查重** | 编辑筛重参数；填写 `we_install_dir` 并勾选 `include_myprojects` 后，会一并扫描 `…/projects/myprojects` 下各子文件夹内的视频 |
 | **取消订阅** | 选择筛重 `duplicates_*.xlsx`：每行首列保留，其余列 Steam 由油猴退订，myprojects 本地链会先删文件夹 |
-| **下架归档** | 检测已下架物品、归档到本地 `myprojects`、生成链接并启动取消订阅流程 |
+| **下架归档** | 两类归档 + 两类退订：针对"已下架物品"的自动流程，和针对"任意 WE 文件夹"的手动流程 |
 
 **下架归档** 与 **筛重** 共用 **WE 安装目录**（`we_install_dir`，含 `config.json` 的 WE 根目录）。下架检测建议填写 **Steam API Key**（[申请地址](https://steamcommunity.com/dev/apikey)）：有 Key 时用 `IPublishedFileService`，比无 Key 更准确。
 
-「取消订阅已下架」会打开 `https://steamcommunity.com/my/myworkshopfiles?...`（`/my/` 在已登录浏览器中自动对应当前账号，无需填写个人资料 URL）。
+「取消订阅已下架」和「取消订阅手动归档」都会打开 `https://steamcommunity.com/my/myworkshopfiles?...`（`/my/` 在已登录浏览器中自动对应当前账号，无需填写个人资料 URL）。
 
-建议流程：**检测下架物品** → **归档到本地**（复制 + 改 `config.json`）→ **取消订阅已下架**（浏览器 + 油猴，需已登录 Steam）。
+下架归档页共 5 个操作按钮：
+
+1. **检测下架物品**：调 Steam API 判断哪些订阅项已被删除 / 隐藏，结果写到 `output/delisted_items.json`
+2. **下架物品归档到本地**：把 `delisted_items.json` 里的物品整夹复制到 `projects/myprojects/`，并把路径写回 `config.json` 原文件夹
+3. **指定文件夹归档到本地**：弹出 WE 文件夹选择器（列出 `config.json` 所有分类 + 每个分类的 `workshop` / 已归档 数量），选定后把该文件夹内**所有** workshop 项批量归档到 `myprojects`（已归档的自动跳过）
+4. **取消订阅已下架**：生成 `delisted_unsub_*.xlsx` 并驱动浏览器 + 油猴退订 `delisted_items.json` 里的物品
+5. **取消订阅手动归档**：弹出文件夹选择器，只退订"workshop 订阅中 且 myprojects 已存在"的那部分 wid（未归档的保持订阅），带二次确认弹窗
+
+两套推荐流程：
+
+- **下架物品自动清理**：检测下架物品 → 下架物品归档到本地 → 取消订阅已下架
+- **按分类手动归档**：指定文件夹归档到本地 → 取消订阅手动归档
 
 ### 方式二：命令行
 
@@ -67,7 +78,7 @@ python we_duplicate_finder_readonly.py -c config.toml
 
 结果输出到 `output/` 目录下两份 XLSX：
 
-- **`duplicates_{ts}.xlsx`**：创意工坊链接版。每行第一格保留的条目排在最前（按文件体积降序），取消订阅流程（`bulk_unsub_controller.py`）只认这个文件。myprojects 本地项列为 `file:///...` 本地链接。
+- **`duplicates_{ts}.xlsx`**：创意工坊链接版。每行**第一格 = 保留项**：按文件体积降序排；**大小相等时 `projects/myprojects` 那份优先排前**，保证退订的永远是还没归档的 workshop 版本。取消订阅流程（`bulk_unsub_controller.py`）只认这个文件。myprojects 本地项列为 `file:///...` 本地链接。
 - **`duplicate_paths_{ts}.xlsx`**：所在文件夹路径版（`…\431960\<id>\` / `…\myprojects\<子文件夹>\`）。方便在资源管理器直接打开；Excel 里点击单元格也能开，不会被取消订阅流程误选（文件名前缀故意与 `duplicates_` 区分）。
 
 **下架检测 / 归档：**
@@ -76,7 +87,7 @@ python we_duplicate_finder_readonly.py -c config.toml
 # 仅检测（结果写入 output/delisted_items.json）
 python we_delisted_archiver.py -c config.toml --detect
 
-# 仅归档（需先有 delisted_items.json）
+# 仅归档下架物品（需先有 delisted_items.json）
 python we_delisted_archiver.py -c config.toml --archive
 
 # 检测 + 归档
@@ -85,6 +96,21 @@ python we_delisted_archiver.py -c config.toml --both
 # 指定 Steam API Key（覆盖 config）
 python we_delisted_archiver.py -c config.toml --detect --steam-api-key YOUR_KEY
 ```
+
+**按 WE 文件夹批量归档 / 查询（JSON 到 stdout，日志到 stderr）：**
+
+```bash
+# 列出 config.json 所有文件夹 + 每个文件夹的 workshop / 已归档计数
+python we_delisted_archiver.py -c config.toml --list-folders
+
+# 把第 N 个文件夹里的全部 workshop 项归档到 myprojects（已归档跳过）
+python we_delisted_archiver.py -c config.toml --archive-folder-index 2
+
+# 列出第 N 个文件夹里已归档的 wid（可喂给 bulk_unsub_controller 退订）
+python we_delisted_archiver.py -c config.toml --list-archived-in-folder-index 2
+```
+
+> `--list-folders` / `--list-archived-in-folder-index` 只读，输出纯 JSON 到 stdout，便于脚本化接入；日志统一走 stderr。
 
 **取消订阅：**
 
@@ -99,7 +125,7 @@ python bulk_unsub_controller.py --xlsx duplicates_xxx.xlsx --batch-size 1 --sing
 
 `bulk_unsub_controller.py` 固定按筛重表语义：**每行第一个链接保留**；从第二列起，若为 **`file:///.../myprojects/...`** 则**直接删除**对应 `myprojects/<子项目文件夹>` 整夹，若为 **`http` Steam 链接**则交给油猴取消订阅。
 
-下架物品取消订阅时，UI 会生成 `delisted_unsub_*.xlsx` 并打开 `steamcommunity.com/my/myworkshopfiles?...#bulk_unsub=2`（与 `#bulk_unsub=1` 行为一致，便于区分用途）。
+下架物品取消订阅时，UI 会生成 `delisted_unsub_*.xlsx`；按文件夹批量退订时生成 `archived_unsub_*.xlsx`。两者都会打开 `steamcommunity.com/my/myworkshopfiles?...#bulk_unsub=2`（与 `#bulk_unsub=1` 行为一致，便于区分用途）。
 
 > 如果网络不稳定导致取消订阅卡住，刷新浏览器标签页即可。
 
@@ -285,8 +311,9 @@ DINO 的 per-frame 全局距离只能告诉你"两段视频差多少"，但分�
 ```
 ├── we_ui.py                          # 图形界面（筛重 / 取消订阅 / 下架归档）
 ├── we_duplicate_finder_readonly.py   # 筛重核心脚本
-├── we_delisted_archiver.py           # 下架检测 + 归档 + 生成取消订阅 xlsx
-├── config.toml                       # 配置文件
+├── we_delisted_archiver.py           # 下架检测 + 归档 + 按文件夹归档 + 生成退订 xlsx
+├── semantic_features.py              # DINOv2/v3 加载与 patch 级空间裁决
+├── config.example.toml               # 配置模板（真实 config.toml 本地自建，已 .gitignore）
 ├── requirements.txt                  # Python 依赖
 ├── 取消收藏已下架的创意工坊物品-0.1.user.js   # 参考用：浏览器内检测下架并取消订阅
 ├── output/
@@ -295,7 +322,8 @@ DINO 的 per-frame 全局距离只能告诉你"两段视频差多少"，但分�
 │   ├── duplicates_*.xlsx             # 筛重结果（创意工坊链接版，取消订阅流程使用）
 │   ├── duplicate_paths_*.xlsx        # 筛重结果（所在文件夹路径版，人工处理用）
 │   ├── delisted_items.json           # 下架检测结果（由 we_delisted_archiver 生成）
-│   └── delisted_unsub_*.xlsx         # 下架物品取消订阅列表（UI 生成）
+│   ├── delisted_unsub_*.xlsx         # 下架物品取消订阅列表（UI 生成）
+│   └── archived_unsub_*.xlsx         # 按文件夹取消订阅列表（UI 生成）
 └── wallpaper-engine-video-deduplication.js  # Tampermonkey：#bulk_unsub=1 / =2
 ```
 
