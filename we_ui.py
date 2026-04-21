@@ -521,7 +521,6 @@ class App(QMainWindow):
         def add_line(row: int, label: str, key: str) -> int:
             grid.addWidget(self._make_label(label), row, 0)
             w = QLineEdit()
-            w.setClearButtonEnabled(True)
             grid.addWidget(w, row, 1)
             self._dedup_fields[key] = w
             return row + 1
@@ -544,7 +543,6 @@ class App(QMainWindow):
         def add_dir(row: int, label: str, key: str) -> int:
             grid.addWidget(self._make_label(label), row, 0)
             w = QLineEdit()
-            w.setClearButtonEnabled(True)
             grid.addWidget(w, row, 1)
             self._dedup_fields[key] = w
             btn = QPushButton("…")
@@ -556,7 +554,6 @@ class App(QMainWindow):
         def add_file(row: int, label: str, key: str) -> int:
             grid.addWidget(self._make_label(label), row, 0)
             w = QLineEdit()
-            w.setClearButtonEnabled(True)
             grid.addWidget(w, row, 1)
             self._dedup_fields[key] = w
             btn = QPushButton("…")
@@ -904,7 +901,6 @@ class App(QMainWindow):
 
         g.addWidget(QLabel("xlsx（duplicates_*.xlsx）："), 0, 0)
         self.unsub_xlsx = QLineEdit()
-        self.unsub_xlsx.setClearButtonEnabled(True)
         g.addWidget(self.unsub_xlsx, 0, 1, 1, 3)
         b1 = QPushButton("选择…"); b1.clicked.connect(self._pick_xlsx); g.addWidget(b1, 0, 4)
         b2 = QPushButton("选最新"); b2.clicked.connect(self._pick_latest_xlsx); g.addWidget(b2, 0, 5)
@@ -931,11 +927,7 @@ class App(QMainWindow):
 
         g.addWidget(QLabel("single-page-url（可选）："), 2, 0)
         self.unsub_single_page_url = QLineEdit()
-        self.unsub_single_page_url.setClearButtonEnabled(True)
-        g.addWidget(self.unsub_single_page_url, 2, 1, 1, 5)
-        b4 = QPushButton("清空")
-        b4.clicked.connect(lambda: self.unsub_single_page_url.clear())
-        g.addWidget(b4, 2, 6)
+        g.addWidget(self.unsub_single_page_url, 2, 1, 1, 6)
 
         note = QLabel("提示：筛重表每行第一列为保留项；其余列 Steam 链接由油猴退订，myprojects 的 file:/// 会先本地删夹。需已登录 Steam。")
         note.setWordWrap(True)
@@ -1024,7 +1016,6 @@ class App(QMainWindow):
         # WE 安装目录 —— 与筛重 tab 的 we_install_dir 共享同一字段值（非双向绑定，主要以筛重 tab 为源）
         g.addWidget(QLabel("WE 安装目录："), 0, 0)
         self.arc_we_install_dir = QLineEdit()
-        self.arc_we_install_dir.setClearButtonEnabled(True)
         # 失焦或回车时原子写入 config.toml（只覆盖 we_install_dir 一项，其余键不动）
         self.arc_we_install_dir.editingFinished.connect(self._arc_autosave)
         g.addWidget(self.arc_we_install_dir, 0, 1, 1, 2)
@@ -1035,7 +1026,6 @@ class App(QMainWindow):
         g.addWidget(QLabel("Steam API Key（推荐）："), 1, 0)
         self.arc_steam_api_key = QLineEdit()
         self.arc_steam_api_key.setEchoMode(QLineEdit.EchoMode.Password)
-        self.arc_steam_api_key.setClearButtonEnabled(True)
         self.arc_steam_api_key.editingFinished.connect(self._arc_autosave)
         g.addWidget(self.arc_steam_api_key, 1, 1, 1, 2)
         bk = QPushButton("申请")
