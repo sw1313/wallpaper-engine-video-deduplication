@@ -3187,7 +3187,15 @@ def main():
                         item_to_folder[fs.item_id] = str(fs.path.parent)
             if len(item_to_bestsize) <= 1:
                 continue
-            ordered = sorted(item_to_bestsize.items(), key=lambda kv: kv[1], reverse=True)
+            # 首列 = 取消订阅流程中保留的那份。按文件大小降序；size 相等时
+            # myprojects（item_id 以 "mp:" 开头）优先排前，这样同分辨率同码率的
+            # workshop+myprojects 会把 myprojects 作为保留项，被退订的永远是
+            # 还没归档的 workshop 那份。
+            def _dup_sort_key(kv: Tuple[str, int]) -> Tuple[int, int]:
+                iid, sz = kv
+                is_mp = 1 if iid.startswith("mp:") else 0
+                return (sz, is_mp)
+            ordered = sorted(item_to_bestsize.items(), key=_dup_sort_key, reverse=True)
             urls = [item_to_url[iid] for iid, _ in ordered]
             folders = [item_to_folder[iid] for iid, _ in ordered]
             duplicate_groups_urls.append(urls)

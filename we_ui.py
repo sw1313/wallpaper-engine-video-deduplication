@@ -37,6 +37,7 @@ from PySide6.QtWidgets import (
     QGridLayout,
     QGroupBox,
     QHBoxLayout,
+    QInputDialog,
     QLabel,
     QLineEdit,
     QMainWindow,
@@ -974,9 +975,11 @@ class App(QMainWindow):
 
         btns = QHBoxLayout()
         b1 = QPushButton("检测下架物品"); b1.clicked.connect(self._run_arc_detect); btns.addWidget(b1)
-        b2 = QPushButton("归档到本地");  b2.clicked.connect(self._run_arc_archive); btns.addWidget(b2)
-        b3 = QPushButton("取消订阅已下架"); b3.clicked.connect(self._run_arc_unsub); btns.addWidget(b3)
-        b4 = QPushButton("停止"); b4.clicked.connect(self._stop_running); btns.addWidget(b4)
+        b2 = QPushButton("下架物品归档到本地"); b2.clicked.connect(self._run_arc_archive); btns.addWidget(b2)
+        b3 = QPushButton("指定文件夹归档到本地"); b3.clicked.connect(self._run_arc_archive_folder); btns.addWidget(b3)
+        b4 = QPushButton("取消订阅已下架"); b4.clicked.connect(self._run_arc_unsub); btns.addWidget(b4)
+        b5 = QPushButton("取消订阅手动归档"); b5.clicked.connect(self._run_arc_unsub_folder); btns.addWidget(b5)
+        b6 = QPushButton("停止"); b6.clicked.connect(self._stop_running); btns.addWidget(b6)
         btns.addStretch(1)
         wrap = QWidget(); wrap.setLayout(btns)
         g.addWidget(wrap, 3, 0, 1, 4)
@@ -1089,6 +1092,180 @@ class App(QMainWindow):
         ]
 
         self.log_archive.write(f"[INFO] 已生成 {len(items)} 条取消订阅链接: {xlsx_path}\n")
+        self._start_process(cmd, cwd=REPO_ROOT / "output", sink=self.log_archive)
+
+    # ---- 按指定 WE 文件夹归档 / 退订 ----
+    def _arc_fetch_folders(self, we_dir: str, cfg_path: Path) -> Optional[List[Dict[str, Any]]]:
+        """同步调用 archiver --list-folders，解析 stdout JSON。失败返回 None。"""
+        cmd = [
+            sys.executable,
+            str((REPO_ROOT / "we_delisted_archiver.py").resolve()),
+            "-c", str(cfg_path),
+            "--list-folders",
+            "--we-install-dir", we_dir,
+        ]
+        try:
+            env = {
+                **os.environ,
+                "PYTHONUTF8": "1",
+                "PYTHONIOENCODING": "utf-8",
+            }
+            creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if _is_windows() else 0
+            r = subprocess.run(
+                cmd, cwd=str(REPO_ROOT),
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                env=env, timeout=15, creationflags=creationflags,
+            )
+            out = r.stdout.decode("utf-8", errors="replace")
+            data = json.loads(out)
+        except subprocess.TimeoutExpired:
+            QMessageBox.critical(self, "超时", "读取 WE 文件夹列表超时。")
+            return None
+        except Exception as e:
+            QMessageBox.critical(self, "读取失败", f"无法解析 WE 文件夹列表：{e}")
+            return None
+        if data.get("error"):
+            QMessageBox.critical(self, "出错", f"WE 文件夹列表错误：{data.get('error')}")
+            return None
+        return data.get("folders") or []
+
+    def _arc_pick_folder(self, folders: List[Dict[str, Any]], prompt: str) -> Optional[Dict[str, Any]]:
+        if not folders:
+            QMessageBox.information(self, "无文件夹", "config.json 里没有任何文件夹。")
+            return None
+        labels = [
+            f"[{f['index']}] {f['title']}  (workshop={f['workshop_count']}, 已归档={f['myprojects_count']})"
+            for f in folders
+        ]
+        choice, ok = QInputDialog.getItem(self, "选择 WE 文件夹", prompt, labels, 0, False)
+        if not ok or not choice:
+            return None
+        idx = labels.index(choice)
+        return folders[idx]
+
+    def _run_arc_archive_folder(self) -> None:
+        """把某个 WE 文件夹里的全部 workshop 项归档到 myprojects（已归档的跳过）。"""
+        we_dir = self._arc_we_install_dir_effective()
+        if not we_dir:
+            QMessageBox.critical(self, "参数缺失", "请填写 WE 安装目录。")
+            return
+        wr = self._arc_workshop_root()
+        if not wr:
+            QMessageBox.critical(self, "参数缺失", "请在「筛重」标签页填写 workshop_root。")
+            return
+        cfg_path = self._arc_get_config_path()
+
+        folders = self._arc_fetch_folders(we_dir, cfg_path)
+        if folders is None:
+            return
+        picked = self._arc_pick_folder(folders, "把哪个文件夹里的 workshop 项全部归档到 myprojects？")
+        if not picked:
+            return
+
+        if picked["workshop_count"] == 0:
+            QMessageBox.information(self, "无需归档", f"文件夹 '{picked['title']}' 里没有 workshop 项。")
+            return
+
+        cmd = [
+            sys.executable,
+            str((REPO_ROOT / "we_delisted_archiver.py").resolve()),
+            "-c", str(cfg_path),
+            "--archive-folder-index", str(picked["index"]),
+            "--workshop-root", wr,
+            "--we-install-dir", we_dir,
+        ]
+        self.log_archive.write(
+            f"[INFO] 归档文件夹 '{picked['title']}' → myprojects（workshop={picked['workshop_count']}, "
+            f"已归档跳过={picked['myprojects_count']}）\n"
+        )
+        self._start_process(cmd, cwd=REPO_ROOT, sink=self.log_archive)
+
+    def _run_arc_unsub_folder(self) -> None:
+        """取消订阅手动归档：挑一个 WE 文件夹，把已归档到本地的那些 wid 退订。"""
+        we_dir = self._arc_we_install_dir_effective()
+        if not we_dir:
+            QMessageBox.critical(self, "参数缺失", "请填写 WE 安装目录。")
+            return
+        cfg_path = self._arc_get_config_path()
+
+        folders = self._arc_fetch_folders(we_dir, cfg_path)
+        if folders is None:
+            return
+        picked = self._arc_pick_folder(folders, "哪个文件夹里已归档的项要取消订阅？")
+        if not picked:
+            return
+
+        # 二次查询拿 archived wid 列表
+        cmd_query = [
+            sys.executable,
+            str((REPO_ROOT / "we_delisted_archiver.py").resolve()),
+            "-c", str(cfg_path),
+            "--list-archived-in-folder-index", str(picked["index"]),
+            "--we-install-dir", we_dir,
+        ]
+        try:
+            env = {**os.environ, "PYTHONUTF8": "1", "PYTHONIOENCODING": "utf-8"}
+            creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if _is_windows() else 0
+            r = subprocess.run(
+                cmd_query, cwd=str(REPO_ROOT),
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                env=env, timeout=15, creationflags=creationflags,
+            )
+            data = json.loads(r.stdout.decode("utf-8", errors="replace"))
+        except Exception as e:
+            QMessageBox.critical(self, "查询失败", f"读取已归档 wid 失败：{e}")
+            return
+
+        wids: List[str] = data.get("archived_wids") or []
+        if not wids:
+            QMessageBox.information(
+                self, "无可退订",
+                f"文件夹 '{picked['title']}' 里没有同时在 workshop 订阅且已归档到 myprojects 的项。\n"
+                f"（如果还没归档，请先跑「指定文件夹归档到本地」。）",
+            )
+            return
+
+        ret = QMessageBox.question(
+            self, "确认取消订阅",
+            f"将对文件夹 '{picked['title']}' 中 {len(wids)} 个已归档 wid 发起取消订阅。\n"
+            f"（只退订已经归档到 myprojects 的那些，未归档的保持订阅。）\n\n确认继续？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if ret != QMessageBox.StandardButton.Yes:
+            return
+
+        out_dir = Path(str(self._field_value("output_dir")).strip() or "output")
+        if not out_dir.is_absolute():
+            out_dir = (REPO_ROOT / out_dir).resolve()
+
+        try:
+            from openpyxl import Workbook
+        except ImportError:
+            QMessageBox.critical(self, "缺少依赖", "需要 openpyxl: pip install openpyxl")
+            return
+
+        ts = time.strftime("%Y%m%d_%H%M%S")
+        xlsx_path = out_dir / f"archived_unsub_{ts}.xlsx"
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "archived_unsub"
+        ws.append(["url"])
+        for wid in wids:
+            ws.append([f"https://steamcommunity.com/sharedfiles/filedetails/?id={wid}"])
+        xlsx_path.parent.mkdir(parents=True, exist_ok=True)
+        wb.save(str(xlsx_path))
+
+        cmd = [
+            sys.executable,
+            str((REPO_ROOT / "output" / "bulk_unsub_controller.py").resolve()),
+            "--xlsx", str(xlsx_path),
+            "--batch-size", "1",
+            "--single-page",
+            "--single-page-url", STEAM_MY_SUBS_UNSUB2,
+        ]
+        self.log_archive.write(
+            f"[INFO] 已生成 {len(wids)} 条手动归档退订链接: {xlsx_path}\n"
+        )
         self._start_process(cmd, cwd=REPO_ROOT / "output", sink=self.log_archive)
 
 

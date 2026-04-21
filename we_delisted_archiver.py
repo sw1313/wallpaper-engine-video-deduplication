@@ -410,6 +410,265 @@ def run_archive(
 
 
 # ---------------------------------------------------------------------------
+# Archive a specific WE folder (category) - copy all workshop items → myprojects
+# ---------------------------------------------------------------------------
+
+# 匹配 config.json items 里的两种路径：
+#   workshop:    .../workshop/content/431960/<wid>/...
+#   myprojects:  .../projects/myprojects/<subdir>/...
+import re as _re
+_WORKSHOP_PATH_RE = _re.compile(r"/workshop/content/431960/(\d+)/", _re.IGNORECASE)
+_MYPROJECTS_PATH_RE = _re.compile(r"/projects/myprojects/([^/]+)/", _re.IGNORECASE)
+
+
+def _path_normalize(p: str) -> str:
+    return str(p).replace("\\", "/")
+
+
+def _collect_workshop_in_items(items: Dict[str, Any]) -> List[str]:
+    """从 folder.items 里抓所有 workshop 路径的 wid。"""
+    wids: List[str] = []
+    for raw in (items or {}).keys():
+        m = _WORKSHOP_PATH_RE.search(_path_normalize(raw))
+        if m:
+            wids.append(m.group(1))
+    return wids
+
+
+def _collect_myprojects_in_items(items: Dict[str, Any]) -> List[str]:
+    """从 folder.items 里抓所有 myprojects 子目录名。"""
+    names: List[str] = []
+    for raw in (items or {}).keys():
+        m = _MYPROJECTS_PATH_RE.search(_path_normalize(raw))
+        if m:
+            names.append(m.group(1))
+    return names
+
+
+def _flatten_folders(folders: List[dict], prefix: str = "") -> List[Tuple[str, dict]]:
+    """把 folders 树扁平成 [(display_path, folder_dict), ...]，保留出现顺序。"""
+    out: List[Tuple[str, dict]] = []
+    for f in folders:
+        if not isinstance(f, dict):
+            continue
+        title = str(f.get("title", "?"))
+        display = title if not prefix else f"{prefix} / {title}"
+        out.append((display, f))
+        subs = f.get("subfolders", [])
+        if isinstance(subs, list):
+            out.extend(_flatten_folders(subs, display))
+    return out
+
+
+def _load_we_config(we_install_dir: Path) -> Tuple[Optional[dict], Optional[Path]]:
+    cfg_path = we_install_dir / "config.json"
+    if not cfg_path.exists():
+        log.error("[FOLDER] 找不到 config.json: %s", cfg_path)
+        return None, None
+    try:
+        with cfg_path.open("r", encoding="utf-8") as f:
+            return json.load(f), cfg_path
+    except Exception as e:
+        log.error("[FOLDER] 读取 config.json 失败: %s", e)
+        return None, None
+
+
+def cmd_list_folders(we_install_dir: Path) -> None:
+    """列出 config.json 中全部文件夹 + 各自 workshop / myprojects 条目数，输出 JSON 到 stdout。"""
+    we_cfg, _cfg_path = _load_we_config(we_install_dir)
+    if we_cfg is None:
+        print(json.dumps({"folders": [], "error": "config_json_missing"}, ensure_ascii=False))
+        return
+    container, key = _locate_folders_slot(we_cfg)
+    if container is None or key is None:
+        print(json.dumps({"folders": [], "error": "no_folders_slot"}, ensure_ascii=False))
+        return
+    flat = _flatten_folders(container[key])
+    folders_out: List[Dict[str, Any]] = []
+    for idx, (display, fdict) in enumerate(flat):
+        items = fdict.get("items", {}) or {}
+        ws = _collect_workshop_in_items(items)
+        mp = _collect_myprojects_in_items(items)
+        folders_out.append({
+            "index": idx,
+            "title": display,
+            "workshop_count": len(ws),
+            "myprojects_count": len(mp),
+        })
+    print(json.dumps({"folders": folders_out}, ensure_ascii=False))
+
+
+def _archive_one_wid(
+    wid: str,
+    workshop_root: Path,
+    myprojects_dir: Path,
+    install_dir_unc: str,
+    folder_items: Dict[str, Any],
+) -> Tuple[bool, bool]:
+    """把单个 workshop wid 归档到 myprojects，并把路径加进目标 folder.items。
+
+    返回 (copied, config_added)。copied=False 表示目标已存在或源缺失，没有真实复制。
+    """
+    src_dir = workshop_root / wid
+    dst_dir = myprojects_dir / wid
+
+    copied = False
+    if not src_dir.is_dir():
+        log.warning("[FOLDER-ARC] %s: workshop 源目录不存在，跳过", wid)
+    elif dst_dir.exists():
+        log.info("[FOLDER-ARC] %s: myprojects 已存在，跳过复制", wid)
+    else:
+        try:
+            shutil.copytree(str(src_dir), str(dst_dir))
+            copied = True
+            log.info("[FOLDER-ARC] %s: 已复制到 %s", wid, dst_dir)
+        except Exception as e:
+            log.error("[FOLDER-ARC] %s: 复制失败: %s", wid, e)
+            return (False, False)
+
+    # 读 project.json 拿 file 字段（用 dst > src 顺序，兜底用 src）
+    proj_json = dst_dir / "project.json"
+    if not proj_json.exists():
+        proj_json = src_dir / "project.json"
+    if not proj_json.exists():
+        log.warning("[FOLDER-ARC] %s: 找不到 project.json，跳过 config 更新", wid)
+        return (copied, False)
+    try:
+        with proj_json.open("r", encoding="utf-8") as f:
+            proj = json.load(f)
+    except Exception as e:
+        log.warning("[FOLDER-ARC] %s: 读取 project.json 失败: %s", wid, e)
+        return (copied, False)
+
+    video_file = proj.get("file", "")
+    if not video_file:
+        log.warning("[FOLDER-ARC] %s: project.json 缺 file 字段", wid)
+        return (copied, False)
+
+    rel_path = f"projects/myprojects/{wid}/{video_file}"
+    we_path_entry = _win_path_to_unc_forward(rel_path, install_dir_unc)
+
+    if we_path_entry in folder_items:
+        log.info("[FOLDER-ARC] %s: folder 已包含该 myprojects 条目，跳过", wid)
+        return (copied, False)
+
+    folder_items[we_path_entry] = 1
+    log.info("[FOLDER-ARC] %s: 已添加到 folder.items", wid)
+    return (copied, True)
+
+
+def run_archive_folder(
+    workshop_root: Path,
+    we_install_dir: Path,
+    folder_index: int,
+) -> None:
+    """把 config.json 中指定 folder 内所有 workshop 项归档到 myprojects（不动已归档的）。"""
+    we_cfg, cfg_path = _load_we_config(we_install_dir)
+    if we_cfg is None or cfg_path is None:
+        return
+    container, key = _locate_folders_slot(we_cfg)
+    if container is None or key is None:
+        log.error("[FOLDER-ARC] config.json 找不到 folders 结构")
+        return
+    flat = _flatten_folders(container[key])
+    if not (0 <= folder_index < len(flat)):
+        log.error("[FOLDER-ARC] folder_index 超界: %d（可选 0..%d）", folder_index, len(flat) - 1)
+        return
+    display, target = flat[folder_index]
+
+    install_dir_unc = we_cfg.get("?installdirectory", "")
+    if not install_dir_unc:
+        log.error("[FOLDER-ARC] config.json 缺 ?installdirectory")
+        return
+
+    myprojects_dir = we_install_dir / "projects" / "myprojects"
+    myprojects_dir.mkdir(parents=True, exist_ok=True)
+
+    items = target.get("items", {})
+    if not isinstance(items, dict):
+        log.error("[FOLDER-ARC] folder '%s' items 不是 dict", display)
+        return
+
+    workshop_wids = _collect_workshop_in_items(items)
+    existing_mp = set(_collect_myprojects_in_items(items))
+
+    log.info(
+        "[FOLDER-ARC] 目标 folder: '%s'（workshop=%d, 已归档=%d）",
+        display, len(workshop_wids), len(existing_mp),
+    )
+
+    copied = 0
+    config_added = 0
+    skipped_already = 0
+    for wid in workshop_wids:
+        if wid in existing_mp:
+            skipped_already += 1
+            continue
+        c, a = _archive_one_wid(
+            wid, workshop_root, myprojects_dir, install_dir_unc, items,
+        )
+        if c:
+            copied += 1
+        if a:
+            config_added += 1
+
+    if config_added > 0:
+        _write_config_atomic(cfg_path, we_cfg)
+
+    log.info(
+        "[FOLDER-ARC] 完成 '%s': 复制 %d 个目录, 新增 %d 条 config 条目, 已归档跳过 %d",
+        display, copied, config_added, skipped_already,
+    )
+
+
+def cmd_list_archived_in_folder(
+    we_install_dir: Path,
+    folder_index: int,
+) -> None:
+    """列出指定 folder 中 "workshop 存在 且 myprojects 已归档" 的 wid（用于取消订阅手动归档）。
+
+    识别"已归档"的方式：
+      1) folder.items 里同时有 workshop/content/431960/<wid>/... 和
+         projects/myprojects/<wid>/... 两条路径（最常见）
+      2) 或即便 folder.items 里没有 myprojects 条目，但 myprojects/<wid>/ 目录
+         实际存在（用户自己搬过文件的情况）
+    """
+    we_cfg, _cfg_path = _load_we_config(we_install_dir)
+    if we_cfg is None:
+        print(json.dumps({"wids": [], "error": "config_json_missing"}, ensure_ascii=False))
+        return
+    container, key = _locate_folders_slot(we_cfg)
+    if container is None or key is None:
+        print(json.dumps({"wids": [], "error": "no_folders_slot"}, ensure_ascii=False))
+        return
+    flat = _flatten_folders(container[key])
+    if not (0 <= folder_index < len(flat)):
+        print(json.dumps({"wids": [], "error": "index_out_of_range"}, ensure_ascii=False))
+        return
+    display, target = flat[folder_index]
+    items = target.get("items", {}) or {}
+
+    workshop_wids = _collect_workshop_in_items(items)
+    mp_subnames = set(_collect_myprojects_in_items(items))
+    myprojects_dir = we_install_dir / "projects" / "myprojects"
+
+    archived: List[str] = []
+    for wid in workshop_wids:
+        if wid in mp_subnames:
+            archived.append(wid); continue
+        if (myprojects_dir / wid).is_dir():
+            archived.append(wid); continue
+
+    out = {
+        "folder": display,
+        "index": folder_index,
+        "workshop_total": len(workshop_wids),
+        "archived_wids": archived,
+    }
+    print(json.dumps(out, ensure_ascii=False))
+
+
+# ---------------------------------------------------------------------------
 # Generate xlsx for bulk unsubscribe
 # ---------------------------------------------------------------------------
 
@@ -453,11 +712,13 @@ def generate_unsub_xlsx(delisted_path: Path, output_xlsx: Path) -> Optional[Path
 # ---------------------------------------------------------------------------
 
 def setup_logging():
-    stream = sys.stdout
+    # 所有日志走 stderr；stdout 留给机读 JSON（--list-folders 等子命令）。
+    # 外层 UI 用 stderr=STDOUT 合流捕获，在日志面板里仍能看到全部输出。
+    stream = sys.stderr
     if sys.platform == "win32":
         try:
             stream = io.TextIOWrapper(
-                sys.stdout.buffer, encoding="utf-8", errors="replace", line_buffering=True
+                sys.stderr.buffer, encoding="utf-8", errors="replace", line_buffering=True
             )
         except Exception:
             pass
@@ -478,9 +739,15 @@ def main():
     ap = argparse.ArgumentParser(description="检测并归档已下架创意工坊物品")
     ap.add_argument("-c", "--config", default="config.toml", help="config.toml 路径")
     ap.add_argument("--detect", action="store_true", help="检测下架物品")
-    ap.add_argument("--archive", action="store_true", help="归档到本地 myprojects")
-    ap.add_argument("--both", action="store_true", help="检测 + 归档")
+    ap.add_argument("--archive", action="store_true", help="归档下架物品到本地 myprojects")
+    ap.add_argument("--both", action="store_true", help="检测 + 归档（下架）")
     ap.add_argument("--gen-xlsx", action="store_true", help="从检测结果生成取消订阅 xlsx")
+    ap.add_argument("--list-folders", action="store_true",
+                    help="列出 config.json 中全部文件夹（JSON 到 stdout，供 UI 消费）")
+    ap.add_argument("--archive-folder-index", type=int, default=None,
+                    help="把指定索引的文件夹（来自 --list-folders）内全部 workshop 项归档到 myprojects")
+    ap.add_argument("--list-archived-in-folder-index", type=int, default=None,
+                    help="列出指定文件夹里已归档的 wid（JSON 到 stdout，供 UI 生成退订 xlsx）")
 
     ap.add_argument("--workshop-root", help="覆盖 workshop_root")
     ap.add_argument("--we-install-dir", help="覆盖 we_install_dir")
@@ -500,8 +767,31 @@ def main():
         args.detect = True
         args.archive = True
 
-    if not (args.detect or args.archive or args.gen_xlsx):
+    any_action = (
+        args.detect or args.archive or args.gen_xlsx
+        or args.list_folders
+        or args.archive_folder_index is not None
+        or args.list_archived_in_folder_index is not None
+    )
+    if not any_action:
         ap.print_help()
+        return
+
+    # 先处理"只读 + JSON 到 stdout"的子命令，这类不需要 workshop_root。
+    if args.list_folders:
+        if not we_install_dir or not we_install_dir.is_dir():
+            log.error("we_install_dir 无效: %s", we_install_dir)
+            print(json.dumps({"folders": [], "error": "we_install_dir_invalid"}, ensure_ascii=False))
+            sys.exit(1)
+        cmd_list_folders(we_install_dir)
+        return
+
+    if args.list_archived_in_folder_index is not None:
+        if not we_install_dir or not we_install_dir.is_dir():
+            log.error("we_install_dir 无效: %s", we_install_dir)
+            print(json.dumps({"wids": [], "error": "we_install_dir_invalid"}, ensure_ascii=False))
+            sys.exit(1)
+        cmd_list_archived_in_folder(we_install_dir, args.list_archived_in_folder_index)
         return
 
     if args.detect:
@@ -515,6 +805,15 @@ def main():
             log.error("we_install_dir 无效: %s", we_install_dir)
             sys.exit(1)
         run_archive(workshop_root, we_install_dir, delisted_path)
+
+    if args.archive_folder_index is not None:
+        if not workshop_root or not workshop_root.is_dir():
+            log.error("workshop_root 无效: %s", workshop_root)
+            sys.exit(1)
+        if not we_install_dir or not we_install_dir.is_dir():
+            log.error("we_install_dir 无效: %s", we_install_dir)
+            sys.exit(1)
+        run_archive_folder(workshop_root, we_install_dir, args.archive_folder_index)
 
     if args.gen_xlsx:
         xlsx_path = output_dir / f"delisted_unsub_{time.strftime('%Y%m%d_%H%M%S')}.xlsx"
