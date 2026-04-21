@@ -136,18 +136,23 @@ def _toml_quote(s: str) -> str:
 
 
 def dump_simple_toml(d: Dict[str, Any]) -> str:
-    """只覆盖本项目 config.toml 用到的原始类型（str/int/float/bool）。"""
+    """只覆盖本项目 config.toml 用到的原始类型（str/int/float/bool/list[str]）。"""
+    def _fmt_scalar(v: Any) -> str:
+        if isinstance(v, bool):
+            return "true" if v else "false"
+        if isinstance(v, int):
+            return str(v)
+        if isinstance(v, float):
+            return repr(float(v))
+        return _toml_quote(str(v))
+
     lines: List[str] = []
     for k, v in d.items():
-        if isinstance(v, bool):
-            vv = "true" if v else "false"
-        elif isinstance(v, int):
-            vv = str(v)
-        elif isinstance(v, float):
-            vv = repr(float(v))
+        if isinstance(v, list):
+            parts = [_fmt_scalar(x) for x in v]
+            lines.append(f"{k} = [{', '.join(parts)}]")
         else:
-            vv = _toml_quote(str(v))
-        lines.append(f"{k} = {vv}")
+            lines.append(f"{k} = {_fmt_scalar(v)}")
     return "\n".join(lines) + "\n"
 
 
@@ -172,6 +177,30 @@ def find_latest_duplicates_xlsx(out_dir: Path) -> Optional[Path]:
 class ProcHandle:
     popen: subprocess.Popen
     reader_thread: threading.Thread
+
+
+# ------------------- custom widgets -------------------
+
+class NoWheelComboBox(QComboBox):
+    """禁止滚轮改动选择项——下拉框里滚轮误触发会把参数改掉。"""
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+
+    def wheelEvent(self, event: Any) -> None:  # type: ignore[override]
+        event.ignore()
+
+
+class NoWheelSpinBox(QSpinBox):
+    """同理：滚轮不要改数值，防止在滚动表单时误改配置。"""
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+
+    def wheelEvent(self, event: Any) -> None:  # type: ignore[override]
+        event.ignore()
 
 
 # ------------------- Log sink -------------------
@@ -445,9 +474,13 @@ class App(QMainWindow):
         btn_reload = QPushButton("加载")
         btn_reload.clicked.connect(self._reload_config)
         top.addWidget(btn_reload)
-        btn_save = QPushButton("另存为…")
-        btn_save.clicked.connect(self._save_config_as)
+        btn_save = QPushButton("保存")
+        btn_save.setToolTip("保存到当前选中的 config 路径")
+        btn_save.clicked.connect(self._save_config)
         top.addWidget(btn_save)
+        btn_save_as = QPushButton("另存为…")
+        btn_save_as.clicked.connect(self._save_config_as)
+        top.addWidget(btn_save_as)
         outer.addLayout(top)
 
         # 中部：左右分栏 —— 左边表单（可滚动），右边日志
@@ -502,7 +535,7 @@ class App(QMainWindow):
 
         def add_choice(row: int, label: str, key: str, options: List[str]) -> int:
             grid.addWidget(self._make_label(label), row, 0)
-            w = QComboBox()
+            w = NoWheelComboBox()
             w.addItems(options)
             grid.addWidget(w, row, 1)
             self._dedup_fields[key] = w
@@ -680,16 +713,52 @@ class App(QMainWindow):
         if p:
             line.setText(p)
 
+    def _save_config(self) -> None:
+        p = Path(self.dedup_config_path.text().strip() or str(REPO_ROOT / "config.toml"))
+        self._write_config_to(p)
+
     def _save_config_as(self) -> None:
+        current = self.dedup_config_path.text().strip() or str(REPO_ROOT / "config.toml")
         p, _ = QFileDialog.getSaveFileName(
-            self, "另存为 config.toml", str(REPO_ROOT / "config.toml"), "TOML (*.toml);;All (*.*)"
+            self, "另存为 config.toml", current, "TOML (*.toml);;All (*.*)"
         )
         if not p:
             return
-        cfg = self._collect_dedup_config_dict()
-        Path(p).write_text(dump_simple_toml(cfg), encoding="utf-8")
-        QMessageBox.information(self, "已保存", f"已保存：{p}")
+        self._write_config_to(Path(p))
         self.dedup_config_path.setText(p)
+
+    def _write_config_to(self, p: Path) -> None:
+        """合并：
+           1) 当前磁盘上的文件作为基底（保留 force_merge_pairs / force_split_pairs 等 UI 没管的键）
+           2) 表单字段覆盖
+           3) 下架归档 tab 的两个字段覆盖（WE 安装目录与 Steam API Key）
+        """
+        base: Dict[str, Any] = {}
+        try:
+            if p.exists():
+                base = load_toml(p) or {}
+        except Exception:
+            base = {}
+
+        form = self._collect_dedup_config_dict()
+        merged: Dict[str, Any] = dict(base)
+        merged.update(form)
+
+        # 下架归档 tab 里输入的值优先于表单里 we_install_dir（若 arc 留空则沿用 form）
+        if hasattr(self, "arc_we_install_dir"):
+            arc_v = self.arc_we_install_dir.text().strip()
+            if arc_v:
+                merged["we_install_dir"] = arc_v
+        if hasattr(self, "arc_steam_api_key"):
+            merged["steam_api_key"] = self.arc_steam_api_key.text()
+
+        try:
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(dump_simple_toml(merged), encoding="utf-8")
+        except Exception as e:
+            QMessageBox.critical(self, "保存失败", str(e))
+            return
+        QMessageBox.information(self, "已保存", f"已保存：{p}")
 
     def _load_config_into_form(self, p: Path) -> None:
         data = load_toml(p)
@@ -707,7 +776,9 @@ class App(QMainWindow):
                 if vv:
                     self._field_set(key, _which(vv))
 
-        # 下架归档 tab 共用
+        # 下架归档 tab 共用：WE 安装目录 + API Key 都从同一个 config 读
+        if hasattr(self, "arc_we_install_dir"):
+            self.arc_we_install_dir.setText(str(merged.get("we_install_dir", "")))
         if hasattr(self, "arc_steam_api_key"):
             self.arc_steam_api_key.setText(str(merged.get("steam_api_key", "")))
 
@@ -845,7 +916,7 @@ class App(QMainWindow):
         g.addWidget(self.unsub_single_page, 1, 0)
 
         g.addWidget(QLabel("batch-size："), 1, 1, Qt.AlignmentFlag.AlignRight)
-        self.unsub_batch_size = QSpinBox()
+        self.unsub_batch_size = NoWheelSpinBox()
         self.unsub_batch_size.setRange(1, 50)
         self.unsub_batch_size.setValue(1)
         g.addWidget(self.unsub_batch_size, 1, 2)
