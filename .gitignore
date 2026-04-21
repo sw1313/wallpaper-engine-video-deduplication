@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.venv/
+venv/
+env/
+
+# Editors / OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# 本地私有配置（含个人路径 / Steam API Key）
+# 仓库只提交 config.example.toml，复制一份为 config.toml 本地使用
+config.toml
+
+# 模型权重缓存（DINOv2 / DINOv3 动辄数百 MB）
+models_cache/
+
+# 日志
+*.log
+
+# 筛重运行时产物（均在 output/ 下）
+output/__pycache__/
+output/we_dedup_cache.sqlite3
+output/we_dedup_cache.sqlite3-journal
+output/we_dedup_cache.sqlite3-wal
+output/we_dedup_cache.sqlite3-shm
+output/we_dedup_state.json
+output/duplicates_*.xlsx
+output/duplicate_paths_*.xlsx
+output/diff_duplicate_paths_*.xlsx
+output/delisted_items.json
+output/delisted_unsub_*.xlsx

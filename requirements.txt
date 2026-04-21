@@ -5,3 +5,8 @@ openpyxl==3.1.5
 tqdm==4.66.4
 tomli==2.0.1
 requests==2.32.3
+
+# 可选依赖：启用视觉语义特征（DINOv2 第三道闸）需要装 torch。
+# 默认不启用（semantic_feature_enabled=false），未启用时本项目 **不 import torch**。
+# GPU (CUDA 12.x): pip install torch --index-url https://download.pytorch.org/whl/cu121
+# CPU:            pip install torch --index-url https://download.pytorch.org/whl/cpu

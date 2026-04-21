@@ -2,11 +2,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import argparse, os, time, subprocess, webbrowser, json, threading
+import argparse, os, shutil, time, subprocess, webbrowser, json, threading
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
-from typing import List, Deque
-from urllib.parse import urlparse, urlunparse, parse_qs, urlencode
+from typing import List, Deque, Optional, Set, Tuple
+from urllib.parse import urlparse, unquote, urlunparse, parse_qs, urlencode
+from urllib.request import url2pathname
 from collections import deque, Counter
 import re, requests
 from openpyxl import load_workbook
@@ -161,44 +162,150 @@ def open_url(url: str):
         webbrowser.open_new_tab(url)
 
 # ========== Excel & URL 工具 ==========
-def read_urls_from_xlsx(xlsx_path: Path, keep_first_http_per_row: bool = False) -> List[str]:
+
+def _is_link_cell(s: str) -> bool:
+    t = s.strip()
+    return t.startswith("http") or t.lower().startswith("file:")
+
+
+def _file_uri_to_path(uri: str) -> Optional[Path]:
+    u = uri.strip()
+    p = urlparse(u)
+    if p.scheme != "file":
+        return None
+    try:
+        raw = p.path or ""
+        # Windows: file:///C:/x -> path /C:/x
+        local = url2pathname(unquote(raw))
+        return Path(local)
+    except Exception:
+        return None
+
+
+def _parse_myprojects_video_path(cell: str) -> Optional[Path]:
+    """将单元格解析为视频文件路径（file: 或含盘符的绝对路径）。"""
+    s = (cell or "").strip()
+    if not s:
+        return None
+    if s.lower().startswith("file:"):
+        return _file_uri_to_path(s)
+    # 裸 Windows/UNC 路径（筛重导出一般为 file:，兼容手动粘贴）
+    if len(s) > 2 and s[1] == ":" and "myprojects" in s.replace("\\", "/").lower():
+        try:
+            return Path(s)
+        except Exception:
+            return None
+    if s.startswith("\\\\") and "myprojects" in s.replace("\\", "/").lower():
+        try:
+            return Path(s)
+        except Exception:
+            return None
+    return None
+
+
+def _myprojects_item_root(video_path: Path) -> Optional[Path]:
+    """.../projects/myprojects/<子文件夹>/xxx.mp4 -> .../myprojects/<子文件夹>"""
+    try:
+        p = video_path.resolve()
+    except Exception:
+        p = video_path
+    parts = p.parts
+    lower = [x.lower() for x in parts]
+    for i, seg in enumerate(lower):
+        if seg == "myprojects" and i + 1 < len(parts):
+            return Path(*parts[: i + 2])
+    return None
+
+
+def _safe_rmtree_myprojects_item(root: Path, deleted: Set[str]) -> bool:
+    """删除 myprojects 下的单个项目文件夹（整夹）。同一任务内去重。"""
+    try:
+        root = root.resolve()
+    except Exception:
+        pass
+    key = str(root)
+    if key in deleted:
+        return True
+    if not root.is_dir():
+        print(f"[DELETE-SKIP] 不是目录或不存在: {root}")
+        return False
+    parts_lower = [p.lower() for p in root.parts]
+    if "myprojects" not in parts_lower:
+        print(f"[DELETE-SKIP] 路径不在 myprojects 下，拒绝删除: {root}")
+        return False
+    # 必须是 .../myprojects/<一层子目录>，防止误删整个 myprojects
+    try:
+        mp_idx = parts_lower.index("myprojects")
+    except ValueError:
+        return False
+    if len(root.parts) != mp_idx + 2:
+        print(f"[DELETE-SKIP] 只删除 myprojects 下直接子文件夹，跳过: {root}")
+        return False
+    try:
+        shutil.rmtree(root)
+        deleted.add(key)
+        print(f"[DELETE] 已删除本地 myprojects 项目夹: {root}")
+        return True
+    except Exception as e:
+        print(f"[DELETE-FAIL] {root}: {e}")
+        return False
+
+
+def read_urls_from_xlsx(xlsx_path: Path) -> Tuple[List[str], int]:
+    """
+    读取筛重 duplicates_*.xlsx：每行**第一个链接保留**（要留下的那份）；
+    从第二列起的链接：myprojects 本地 file:/// 则**删除项目文件夹**，http Steam 链接进入取消订阅队列。
+    返回 (steam_urls, deleted_folder_count)。
+    """
     wb = load_workbook(filename=str(xlsx_path), read_only=True, data_only=True)
     ws = wb.active
     out: List[str] = []
+    deleted_roots: Set[str] = set()
+    delete_ops = 0
     it = ws.iter_rows(values_only=True)
     header = next(it, None)  # noqa: F841
     first = next(it, None)
     if not first:
         wb.close()
-        return out
+        return out, 0
 
-    def first_http_idx(r):
+    def first_link_col_idx(r):
         for i, cell in enumerate(r):
-            if isinstance(cell, str) and cell.strip().startswith("http"):
+            if isinstance(cell, str) and _is_link_cell(cell):
                 return i
         return None
 
-    start_idx = first_http_idx(first)
-    # 兼容不同来源的 Excel：
-    # - 本仓库筛重导出的 duplicates_*.xlsx：链接从 B 列开始（索引 1）
-    # - 旧格式/其他来源：可能从 C 列开始（索引 2）
+    start_idx = first_link_col_idx(first)
     if start_idx is None:
-        start_idx = 2
+        start_idx = 1  # 默认从 B 列（筛重 duplicates_*.xlsx）
 
-    def collect_http_cells(row):
+    def collect_link_cells(row) -> List[str]:
         urls: List[str] = []
         for cell in row[start_idx:]:
             if isinstance(cell, str):
                 u = cell.strip()
-                if u.startswith("http"):
+                if _is_link_cell(u):
                     urls.append(u)
         return urls
 
     def consume_row(row):
-        urls = collect_http_cells(row)
-        if keep_first_http_per_row and urls:
-            urls = urls[1:]  # 每组保留第一个链接（筛重导出已按最大文件排序）
-        out.extend(urls)
+        nonlocal delete_ops
+        links = collect_link_cells(row)
+        if not links:
+            return
+        targets = links[1:]  # 首列始终保留（筛重已按最大文件排在第一列）
+        for u in targets:
+            vp = _parse_myprojects_video_path(u)
+            if vp is not None and vp.exists():
+                root = _myprojects_item_root(vp)
+                if root and _safe_rmtree_myprojects_item(root, deleted_roots):
+                    delete_ops += 1
+                elif root is None:
+                    print(f"[DELETE-SKIP] 无法定位 myprojects 项目目录: {u[:120]}")
+            elif u.strip().lower().startswith("file:"):
+                print(f"[DELETE-SKIP] file: 链接无法解析或文件已不存在: {u[:120]}")
+            elif u.strip().startswith("http"):
+                out.append(u.strip())
 
     consume_row(first)
     for row in it:
@@ -206,7 +313,7 @@ def read_urls_from_xlsx(xlsx_path: Path, keep_first_http_per_row: bool = False) 
             continue
         consume_row(row)
     wb.close()
-    return out
+    return out, delete_ops
 
 def add_or_update_query(url: str, key: str, value: str) -> str:
     p = urlparse(url); q = parse_qs(p.query); q[key] = [value]
@@ -258,15 +365,19 @@ def main():
     ap.add_argument("--notify-port", type=int, default=8787, help="本地回调端口（与脚本一致）")
     ap.add_argument("--single-page", action="store_true", help="单页面模式：在固定页面上批量取消订阅，避免触发速率限制")
     ap.add_argument("--single-page-url", type=str, default="", help="单页面模式使用的固定 URL（默认使用列表中的第一个）")
-    ap.add_argument("--keep-largest-in-group", action="store_true",
-                    help="适配筛重导出的 duplicates_*.xlsx：每行第一个链接为最大项，保留它，其余链接才执行取消订阅")
     args = ap.parse_args()
 
     if not args.xlsx.exists():
         print(f"找不到文件：{args.xlsx}"); return
-    raw = read_urls_from_xlsx(args.xlsx, keep_first_http_per_row=bool(args.keep_largest_in_group))
+    raw, n_local_deleted = read_urls_from_xlsx(args.xlsx)
+    if n_local_deleted:
+        print(f"[LOCAL] 已直接删除 {n_local_deleted} 个 myprojects 项目文件夹（每行非首列）")
     if not raw:
-        print("Excel 中未找到链接（从 C 列开始）。"); return
+        print("Excel 中无待取消订阅的 Steam 链接（本地 myprojects 已按上表处理）。")
+        if n_local_deleted:
+            return
+        print("（也未执行任何本地删除。）")
+        return
 
     # 去重
     seen=set(); urls=[]

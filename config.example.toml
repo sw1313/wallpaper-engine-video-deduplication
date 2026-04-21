@@ -1,0 +1,116 @@
+# 复制本文件为 config.toml 后按你的环境修改路径即可。
+# 所有阈值均为实测调优后的默认值，除非想改判决策略否则无需改动。
+
+# —— 路径（必填）——
+workshop_root = "E:\\SteamLibrary\\steamapps\\workshop\\content\\431960"
+we_install_dir = "E:\\SteamLibrary\\steamapps\\common\\wallpaper_engine"
+include_myprojects = true
+output_dir = "output"
+model_cache_dir = "models_cache"
+
+# —— 外部工具（在 PATH 里就填名字，否则填绝对路径）——
+ffmpeg_path = "ffmpeg"
+ffprobe_path = "ffprobe"
+fpcalc_path = "fpcalc"
+
+# —— 采样参数 ——
+video_window_seconds = 15
+audio_window_seconds = 60
+seek_ratio = 0.5
+sample_frames = 36
+phash_size = 12
+
+# —— pHash 闸 ——
+phash_distance_threshold = 1.5
+phash_trimmed_mean_cap = 12.0
+phash_trim_ratio = 0.2
+phash_bimodal_gap_cap = 40.0
+
+# —— 颜色闸 ——
+color_hist_bins_h = 16
+color_hist_bins_s = 4
+color_distance_threshold = 0.15
+
+# —— 音频闸 ——
+audio_merge_override_color = false
+audio_merge_threshold = 0.15
+
+# —— 视觉语义（DINO）——
+semantic_feature_enabled = true
+semantic_feature_model = "dinov2_s"      # dinov2_s / dinov2_b / dinov2_l / dinov3_s / dinov3_b / dinov3_l
+semantic_feature_device = "cuda"         # auto / cuda / cpu
+semantic_sample_frames = 60
+semantic_distance_threshold = 0.015
+semantic_max_threshold = 0.04
+semantic_peak_ratio_threshold = 3.8
+semantic_peak_min_max = 0.015
+semantic_drift_p90_exempt = 0.005
+semantic_drift_sparse_mid_count = 2
+
+# —— Patch 级空间裁决 ——
+semantic_patch_enabled = true
+semantic_patch_grid = 8
+semantic_patch_hot_threshold = 0.015
+semantic_patch_min_hot_patches = 12
+semantic_patch_center_margin = 0.4
+semantic_patch_edge_margin = 0.6
+semantic_patch_corner_merge_frac = 0.55
+semantic_patch_center_split_frac = 0.45
+semantic_patch_persistent_frame_frac = 0.5
+semantic_patch_persistent_min = 2
+semantic_patch_persistent_max = 8
+semantic_patch_persistent_corner_min = 0.8
+semantic_patch_weak_center_max = 0.12
+semantic_patch_weak_hot_ratio_max = 0.1
+semantic_patch_heavy_persistent_min = 10
+semantic_patch_heavy_hot_ratio_min = 0.2
+semantic_patch_heavy_pers_corner_max = 0.85
+semantic_patch_heavy_min_ratio = 2.5
+semantic_patch_center_persistent_corner_max = 0.2
+semantic_patch_center_persistent_total_corner_max = 0.25
+semantic_patch_anim_max_override_factor = 2.5
+semantic_patch_ratio_rescue_corner_min = 0.60
+semantic_patch_ratio_rescue_center_max = 0.15
+semantic_patch_ratio_rescue_mean_max = 0.010
+semantic_patch_max_rescue_corner_min = 0.75
+semantic_patch_max_rescue_center_max = 0.10
+semantic_patch_max_rescue_mean_max = 0.010
+
+# —— 中心 patch mask 复验（纯像素 rescue 确认）——
+# 对 DINO patch grid 屏蔽外圈两层，只查内圈 keep×keep 的 cosine 距离；
+# 若中心区 mean/max/hot-ratio 都足够小（水印/字幕/边缘压缩不干扰中心语义），直接放行。
+semantic_patch_center_mask_enabled = true
+semantic_patch_center_mask_inner = 4
+semantic_patch_center_mask_mean_max = 0.006
+semantic_patch_center_mask_max_max = 0.025
+semantic_patch_center_mask_hot_ratio_max = 0.06
+# 二级放行层：只用于 max-corner-dominant 的 uncertain 候选
+semantic_patch_center_mask_relaxed_enabled = true
+semantic_patch_center_mask_relaxed_hot_ratio_max = 0.14
+semantic_patch_center_mask_relaxed_dom_q_max = 0.30
+semantic_patch_center_mask_relaxed_corner_min = 0.85
+semantic_patch_center_mask_relaxed_center_max = 0.05
+semantic_patch_center_mask_relaxed_mean_max = 0.0065
+semantic_patch_center_mask_relaxed_p90_max = 0.010
+semantic_patch_center_mask_relaxed_max_max = 0.060
+
+# —— 其他 ——
+duration_rounding = "nearest_1.0"
+require_both_signatures = false
+duration_cross_bucket_tolerance = 0.6
+max_workers_stage1 = 8
+max_workers_stage2 = 6
+ffprobe_timeout = 60
+ffmpeg_timeout = 60
+fpcalc_timeout = 60
+log_file = "we_duplicate.log"
+progress = true
+
+# —— 人工覆写（兜底，默认空）——
+# 格式 "wid_A|wid_B"；先 force_split 再 force_merge
+force_merge_pairs = []
+force_split_pairs = []
+
+# —— 下架归档（we_delisted_archiver.py 用到）——
+# 建议填写 Steam API Key，详情见 README。本文件不要提交到 git。
+steam_api_key = ""
