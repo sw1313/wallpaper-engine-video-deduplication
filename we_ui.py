@@ -1025,15 +1025,18 @@ class App(QMainWindow):
         g.addWidget(QLabel("WE 安装目录："), 0, 0)
         self.arc_we_install_dir = QLineEdit()
         self.arc_we_install_dir.setClearButtonEnabled(True)
+        # 失焦或回车时原子写入 config.toml（只覆盖 we_install_dir 一项，其余键不动）
+        self.arc_we_install_dir.editingFinished.connect(self._arc_autosave)
         g.addWidget(self.arc_we_install_dir, 0, 1, 1, 2)
         bd = QPushButton("选择…")
-        bd.clicked.connect(lambda: self._pick_dir_into(self.arc_we_install_dir))
+        bd.clicked.connect(lambda: (self._pick_dir_into(self.arc_we_install_dir), self._arc_autosave()))
         g.addWidget(bd, 0, 3)
 
         g.addWidget(QLabel("Steam API Key（推荐）："), 1, 0)
         self.arc_steam_api_key = QLineEdit()
         self.arc_steam_api_key.setEchoMode(QLineEdit.EchoMode.Password)
         self.arc_steam_api_key.setClearButtonEnabled(True)
+        self.arc_steam_api_key.editingFinished.connect(self._arc_autosave)
         g.addWidget(self.arc_steam_api_key, 1, 1, 1, 2)
         bk = QPushButton("申请")
         bk.clicked.connect(lambda: __import__("webbrowser").open("https://steamcommunity.com/dev/apikey"))
@@ -1065,6 +1068,47 @@ class App(QMainWindow):
     # ------------------- archive tab: actions -------------------
     def _arc_get_config_path(self) -> Path:
         return Path(self.dedup_config_path.text().strip() or str(REPO_ROOT / "config.toml"))
+
+    def _arc_autosave(self) -> None:
+        """只把下架归档 tab 的两个字段写回 config.toml，其他键原样保留。
+
+        触发时机：两个 QLineEdit 的 editingFinished（失焦或回车），以及"选择…"
+        按钮选完目录后。失败静默（不弹窗打断用户），仅在日志面板里提示一行。
+        """
+        if not hasattr(self, "arc_we_install_dir") or not hasattr(self, "arc_steam_api_key"):
+            return
+        # 读两个值（we_install_dir 允许写空，相当于让归档流程回退到 form 里的 we_install_dir）
+        new_we = self.arc_we_install_dir.text().strip()
+        new_key = self.arc_steam_api_key.text()
+
+        p = self._arc_get_config_path()
+        try:
+            base: Dict[str, Any] = load_toml(p) if p.exists() else {}
+        except Exception as e:
+            if hasattr(self, "log_archive"):
+                self.log_archive.write(f"[WARN] 自动保存失败（读取旧配置）：{e}\n")
+            return
+
+        # 只有值真正变了才写盘，避免每次 tab 切换 / focus 抖动都重写
+        changed = False
+        if str(base.get("we_install_dir", "")) != new_we:
+            base["we_install_dir"] = new_we
+            changed = True
+        if str(base.get("steam_api_key", "")) != new_key:
+            base["steam_api_key"] = new_key
+            changed = True
+        if not changed:
+            return
+
+        try:
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(dump_simple_toml(base), encoding="utf-8")
+        except Exception as e:
+            if hasattr(self, "log_archive"):
+                self.log_archive.write(f"[WARN] 自动保存失败（写入 {p}）：{e}\n")
+            return
+        if hasattr(self, "log_archive"):
+            self.log_archive.write(f"[INFO] 已自动保存到 {p}\n")
 
     def _arc_workshop_root(self) -> str:
         return str(self._field_value("workshop_root")).strip()
