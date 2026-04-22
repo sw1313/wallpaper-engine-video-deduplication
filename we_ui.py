@@ -24,7 +24,7 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from PySide6.QtCore import Qt, QObject, QTimer, Signal
 from PySide6.QtGui import QFont, QFontDatabase, QGuiApplication, QTextCursor
@@ -354,7 +354,13 @@ class App(QMainWindow):
             except Exception:
                 pass
 
-    def _start_process(self, cmd: List[str], cwd: Path, sink: LogSink) -> None:
+    def _start_process(
+        self,
+        cmd: List[str],
+        cwd: Path,
+        sink: LogSink,
+        on_finish: Optional[Callable[[Optional[int]], None]] = None,
+    ) -> None:
         if self.proc and self.proc.popen.poll() is None:
             QMessageBox.warning(self, "正在运行", "已有任务在运行，请先停止。")
             return
@@ -404,11 +410,36 @@ class App(QMainWindow):
                     p.stdout.close()
                 except Exception:
                     pass
+                if on_finish is not None:
+                    try:
+                        on_finish(code)
+                    except Exception as cb_e:
+                        sink.write(f"[UI] on_finish 回调失败: {cb_e}\n")
 
         t = threading.Thread(target=_reader, daemon=True)
         t.start()
         self.proc = ProcHandle(popen=p, reader_thread=t)
         _prevent_sleep()
+
+    @staticmethod
+    def _safe_unlink(path: Path) -> bool:
+        try:
+            if path.exists():
+                path.unlink()
+                return True
+        except Exception:
+            pass
+        return False
+
+    def _cleanup_unsub_xlsx(self, rc: Optional[int], xlsx_path: Path, sink: "LogSink") -> None:
+        """退订子进程结束回调：rc==0 时删掉 pending xlsx，其它情况保留以便复盘 / 重试。"""
+        if rc == 0:
+            if self._safe_unlink(xlsx_path):
+                sink.write(f"[INFO] 已清理退订清单文件: {xlsx_path.name}\n")
+        else:
+            sink.write(
+                f"[INFO] 退订未正常完成 (rc={rc})，保留 {xlsx_path.name} 以便复查 / 重跑。\n"
+            )
 
     def _stop_running(self) -> None:
         if not self.proc:
@@ -1176,8 +1207,9 @@ class App(QMainWindow):
             QMessageBox.critical(self, "缺少依赖", "需要 openpyxl: pip install openpyxl")
             return
 
-        ts = time.strftime("%Y%m%d_%H%M%S")
-        xlsx_path = out_dir / f"delisted_unsub_{ts}.xlsx"
+        xlsx_path = out_dir / "delisted_unsub_pending.xlsx"
+        # 每次点按钮都重新生成——xlsx 只反映"当下这一次"的状态，避免历史文件混用。
+        self._safe_unlink(xlsx_path)
         wb = Workbook()
         ws = wb.active
         ws.title = "delisted"
@@ -1197,7 +1229,12 @@ class App(QMainWindow):
         ]
 
         self.log_archive.write(f"[INFO] 已生成 {len(items)} 条取消订阅链接: {xlsx_path}\n")
-        self._start_process(cmd, cwd=REPO_ROOT / "output", sink=self.log_archive)
+        self._start_process(
+            cmd,
+            cwd=REPO_ROOT / "output",
+            sink=self.log_archive,
+            on_finish=lambda rc: self._cleanup_unsub_xlsx(rc, xlsx_path, self.log_archive),
+        )
 
     # ---- 按指定 WE 文件夹归档 / 退订 ----
     def _arc_fetch_folders(self, we_dir: str, cfg_path: Path) -> Optional[List[Dict[str, Any]]]:
@@ -1349,8 +1386,9 @@ class App(QMainWindow):
             QMessageBox.critical(self, "缺少依赖", "需要 openpyxl: pip install openpyxl")
             return
 
-        ts = time.strftime("%Y%m%d_%H%M%S")
-        xlsx_path = out_dir / f"archived_unsub_{ts}.xlsx"
+        xlsx_path = out_dir / "archived_unsub_pending.xlsx"
+        # 每次点按钮都重新生成——xlsx 只反映"当下这一次"从 config.json 查到的状态。
+        self._safe_unlink(xlsx_path)
         wb = Workbook()
         ws = wb.active
         ws.title = "archived_unsub"
@@ -1371,7 +1409,12 @@ class App(QMainWindow):
         self.log_archive.write(
             f"[INFO] 已生成 {len(wids)} 条手动归档退订链接: {xlsx_path}\n"
         )
-        self._start_process(cmd, cwd=REPO_ROOT / "output", sink=self.log_archive)
+        self._start_process(
+            cmd,
+            cwd=REPO_ROOT / "output",
+            sink=self.log_archive,
+            on_finish=lambda rc: self._cleanup_unsub_xlsx(rc, xlsx_path, self.log_archive),
+        )
 
 
 # ------------------- entry -------------------
