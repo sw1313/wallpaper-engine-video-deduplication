@@ -44,6 +44,23 @@ class UrlQueue:
 
 QUEUE: UrlQueue|None = None
 
+# 最近一次浏览器活动（/batch 或 /report）的时间戳，用于"队列排空后空闲超时自动退出"。
+# 因为当前浏览器扩展并不对每条退订 POST /report，传统的 assigned==done 条件永远不成立，
+# 进程会一直挂着。这里用"静默超时"兜底让进程能自然结束。
+LAST_BROWSER_ACTIVITY_TS: float = 0.0
+_ACT_LOCK = threading.Lock()
+
+def _touch_activity() -> None:
+    global LAST_BROWSER_ACTIVITY_TS
+    with _ACT_LOCK:
+        LAST_BROWSER_ACTIVITY_TS = time.time()
+
+def _seconds_since_activity() -> float:
+    with _ACT_LOCK:
+        if LAST_BROWSER_ACTIVITY_TS <= 0:
+            return 0.0
+        return time.time() - LAST_BROWSER_ACTIVITY_TS
+
 # ========== 回调服务（CORS） ==========
 def _cors(h):
     h.send_header("Access-Control-Allow-Origin", "*")
@@ -79,6 +96,7 @@ class Handler(BaseHTTPRequestHandler):
                     if not url: break
                     wid = extract_workshop_id(url)
                     if wid: ids.append(wid)
+            _touch_activity()
             print(f"[BATCH] 返回 {len(ids)} 个 workshop ID")
             self.send_response(200); _cors(self)
             self.send_header("Content-Type","application/json"); self.end_headers()
@@ -116,6 +134,7 @@ class Handler(BaseHTTPRequestHandler):
         if QUEUE:
             QUEUE.mark_done(ok)
 
+        _touch_activity()
         if path == "/report":
             # 单页面模式：只上报结果，不分配下一条，避免“吞队列”
             print(f"[REPORT] id={wid} status={status} ok={ok}")
@@ -369,6 +388,8 @@ def main():
     ap = argparse.ArgumentParser(description="Steam Workshop 批量取消订阅 控制器（固定池轮转，标签自拉取下一条）")
     ap.add_argument("--xlsx", type=Path, required=True)
     ap.add_argument("--batch-size", type=int, default=10, help="初始打开的标签数（固定池大小）")
+    ap.add_argument("--idle-timeout", type=int, default=60,
+                    help="队列排空后，浏览器若 N 秒内没有任何 /batch 或 /report 活动，则自动退出（秒）。0 = 永不超时（需要手动 Ctrl+C）。")
     ap.add_argument("--add-appid", action="store_true", help="为每个链接补充 ?appid=XXXX")
     ap.add_argument("--notify-port", type=int, default=8787, help="本地回调端口（与脚本一致）")
     ap.add_argument("--single-page", action="store_true", help="单页面模式：在固定页面上批量取消订阅，避免触发速率限制")
@@ -467,24 +488,44 @@ def main():
     try:
         last_done = 0
         check_interval = 0
+        idle_notice_printed = False
+        idle_timeout = max(0, int(args.idle_timeout))
         while True:
             time.sleep(1)
             check_interval += 1
             st = QUEUE.stats()
-            
+
             # 每5秒打印一次进度
             if check_interval >= 5:
                 check_interval = 0
                 if st['done'] > last_done:
                     print(f"[进度] 已完成: {st['done']}（成功:{st.get('ok',0)} 失败:{st.get('fail',0)}） | 队列剩余: {st['left']} | 已分配: {st['assigned']}")
                     last_done = st['done']
-            
-            if st['left']==0 and st['assigned'] == st['done']:
-                # 队列空了且所有任务都完成了
+
+            if st['left'] == 0 and st['assigned'] == st['done']:
+                # 队列空了且所有任务都完成了（浏览器扩展会主动上报 /report 的理想路径）
                 print(f"\n[完成] 所有任务已处理完毕！")
                 print(f"[统计] 总计处理: {st['done']} 个项目（成功:{st.get('ok',0)} 失败:{st.get('fail',0)}）")
                 print(f"[提示] 请查看浏览器控制台确认实际成功/失败数量")
                 break
+
+            # 兜底：队列已排空 + 浏览器空闲超过 idle_timeout 秒 → 认为浏览器跑完了没回报，自动退出。
+            # 这样即使扩展不 POST /report，UI/调用者也能拿到 rc=0 终止子进程。
+            if idle_timeout > 0 and st['left'] == 0 and LAST_BROWSER_ACTIVITY_TS > 0:
+                idle_sec = _seconds_since_activity()
+                if not idle_notice_printed:
+                    print(f"[IDLE] 队列已清空，等待浏览器活动 / 上报（{idle_timeout}s 无活动则自动退出）…")
+                    idle_notice_printed = True
+                if idle_sec >= idle_timeout:
+                    print(
+                        f"\n[完成] 队列已排空且浏览器 {int(idle_sec)}s 无活动，判定为已执行完毕，自动退出。"
+                    )
+                    print(
+                        f"[统计] 分配: {st['assigned']}  已回报完成: {st['done']}"
+                        f"（成功:{st.get('ok',0)} 失败:{st.get('fail',0)}）"
+                    )
+                    print("[提示] 实际成功/失败以浏览器控制台为准。")
+                    break
     except KeyboardInterrupt:
         st = QUEUE.stats()
         print(f"\n[EXIT] 用户中断")
