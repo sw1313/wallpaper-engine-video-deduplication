@@ -473,10 +473,21 @@ def _path_normalize(p: str) -> str:
 
 
 def _collect_workshop_in_items(items: Dict[str, Any]) -> List[str]:
-    """从 folder.items 里抓所有 workshop 路径的 wid。"""
+    """从 folder.items 里抓所有 workshop 订阅项的 wid。
+
+    WE config.json 里 workshop 订阅项通常直接用 wid 字符串做 key（如
+    "3527146660": 1），部分新版本/存量也可能存完整的 UNC 路径
+    "//MACHINE/…/workshop/content/431960/<wid>/…"。两种都要接。
+    """
     wids: List[str] = []
     for raw in (items or {}).keys():
-        m = _WORKSHOP_PATH_RE.search(_path_normalize(raw))
+        s = str(raw)
+        # a) 纯数字 key = 直接就是 wid
+        if s.isdigit():
+            wids.append(s)
+            continue
+        # b) 完整路径 fallback
+        m = _WORKSHOP_PATH_RE.search(_path_normalize(s))
         if m:
             wids.append(m.group(1))
     return wids
