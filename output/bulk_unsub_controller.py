@@ -253,8 +253,14 @@ def _safe_rmtree_myprojects_item(root: Path, deleted: Set[str]) -> bool:
 
 def read_urls_from_xlsx(xlsx_path: Path) -> Tuple[List[str], int]:
     """
-    读取筛重 duplicates_*.xlsx：每行**第一个链接保留**（要留下的那份）；
-    从第二列起的链接：myprojects 本地 file:/// 则**删除项目文件夹**，http Steam 链接进入取消订阅队列。
+    兼容两类 xlsx：
+      1) 筛重 duplicates_*.xlsx：每行 >=2 个链接，第一个保留，从第二列起退订 /
+         删除 myprojects 项目夹；
+      2) delisted_unsub_*.xlsx / archived_unsub_*.xlsx：每行只有 1 个链接，
+         全部作为退订目标（没有"保留列"概念）。
+
+    判定依据：以单行里链接数量自动切换——1 个 → 整行都是 target；
+    >=2 个 → 保留首个，处理其余。
     返回 (steam_urls, deleted_folder_count)。
     """
     wb = load_workbook(filename=str(xlsx_path), read_only=True, data_only=True)
@@ -293,7 +299,9 @@ def read_urls_from_xlsx(xlsx_path: Path) -> Tuple[List[str], int]:
         links = collect_link_cells(row)
         if not links:
             return
-        targets = links[1:]  # 首列始终保留（筛重已按最大文件排在第一列）
+        # 单链接行：整行都是 target（下架 / 手动归档退订场景）
+        # 多链接行：首列保留（筛重场景，已按最大文件排第一列）
+        targets = links if len(links) == 1 else links[1:]
         for u in targets:
             vp = _parse_myprojects_video_path(u)
             if vp is not None and vp.exists():
