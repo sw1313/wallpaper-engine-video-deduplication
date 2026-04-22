@@ -18,6 +18,7 @@ import json
 import logging
 import os
 import shutil
+import stat
 import sys
 import time
 from pathlib import Path
@@ -280,21 +281,67 @@ def _locate_folders_slot(we_cfg: dict) -> Tuple[Optional[dict], Optional[str]]:
 
 
 
+def _force_writable_and_remove(path: str) -> bool:
+    """尽力清除只读属性并删除文件，供 Windows 下覆盖旧 .bak 使用。返回是否已成功删除。"""
+    if not os.path.exists(path):
+        return True
+    try:
+        os.chmod(path, stat.S_IWRITE)
+    except Exception:
+        pass
+    try:
+        os.remove(path)
+        return True
+    except Exception:
+        return False
+
+
 def _write_config_atomic(cfg_path: Path, cfg: dict) -> None:
-    """原子写入 config.json（先备份 .bak，再写临时文件，最后替换）。"""
+    """原子写入 config.json。
+
+    先尽力做个 .bak 备份（失败不阻断主流程，因为 os.replace 本身已经是原子替换）；
+    再写 .tmp；最后 os.replace 替换 config.json。
+
+    备份会遇到的坑（Windows）：
+      1. config.json 自带只读属性时，shutil.copy2 会把同样的只读位带到 .bak，
+         第二次再 copy2 会因目标只读而 PermissionError——先清 readonly 再删。
+      2. 若 WE 正在运行可能锁住 .bak——fallback 到带时间戳的 .bak.YYYYmmdd_HHMMSS。
+    """
     tmp_file = str(cfg_path) + ".tmp"
     bak_file = str(cfg_path) + ".bak"
 
     if cfg_path.is_file():
+        _force_writable_and_remove(bak_file)
         try:
             shutil.copy2(str(cfg_path), bak_file)
+            # copy2 会把只读属性带过来，清掉方便下次覆盖
+            try:
+                os.chmod(bak_file, stat.S_IWRITE)
+            except Exception:
+                pass
             log.info("[ARCHIVE] config.json 已备份到 %s", bak_file)
         except Exception as e:
-            raise RuntimeError(f"备份 config.json 失败: {e}")
+            ts_bak = str(cfg_path) + f".bak.{time.strftime('%Y%m%d_%H%M%S')}"
+            try:
+                shutil.copy2(str(cfg_path), ts_bak)
+                try:
+                    os.chmod(ts_bak, stat.S_IWRITE)
+                except Exception:
+                    pass
+                log.warning(
+                    "[ARCHIVE] %s 不可写（%s），已改备份到 %s",
+                    bak_file, e, ts_bak,
+                )
+            except Exception as e2:
+                log.warning(
+                    "[ARCHIVE] 备份 config.json 失败，继续原子写入（主文件有 os.replace 保护）：%s",
+                    e2,
+                )
 
+    # 写临时文件前也清掉可能存在的残留 .tmp 的只读位
+    _force_writable_and_remove(tmp_file)
     with open(tmp_file, "w", encoding="utf-8") as f:
         json.dump(cfg, f, ensure_ascii=False, indent="\t")
-
     os.replace(tmp_file, str(cfg_path))
     log.info("[ARCHIVE] config.json 已更新")
 
