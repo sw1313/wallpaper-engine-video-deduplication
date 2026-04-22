@@ -403,7 +403,14 @@ class App(QMainWindow):
             except Exception as e:
                 sink.write(f"\n[UI] 读取输出失败：{e}\n")
             finally:
-                code = p.poll()
+                # 子进程刚把 stdout 关掉时，OS 可能还没回收它，poll() 会返回 None。
+                # 这里用 wait(timeout=...) 等一下，最多 5 秒，避免 rc=None 让 on_finish
+                # 判定成"异常"从而漏掉清理（例如退订完成后不删 pending xlsx）。
+                code: Optional[int]
+                try:
+                    code = p.wait(timeout=5)
+                except Exception:
+                    code = p.poll()
                 sink.write(f"\n[EXIT] rc={code}\n")
                 _allow_sleep()
                 try:

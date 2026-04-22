@@ -48,18 +48,28 @@ QUEUE: UrlQueue|None = None
 # 因为当前浏览器扩展并不对每条退订 POST /report，传统的 assigned==done 条件永远不成立，
 # 进程会一直挂着。这里用"静默超时"兜底让进程能自然结束。
 LAST_BROWSER_ACTIVITY_TS: float = 0.0
+# 队列清空后，额外记录一下"返回空 batch 给浏览器的次数"。浏览器只要来询问过
+# 一次 /batch 并拿到空结果，就已经知道"没活儿了"。此刻 controller 可以立刻收工，
+# 不必再等 idle-timeout 那 60s。
+EMPTY_BATCHES_SERVED: int = 0
 _ACT_LOCK = threading.Lock()
 
-def _touch_activity() -> None:
-    global LAST_BROWSER_ACTIVITY_TS
+def _touch_activity(empty_batch: bool = False) -> None:
+    global LAST_BROWSER_ACTIVITY_TS, EMPTY_BATCHES_SERVED
     with _ACT_LOCK:
         LAST_BROWSER_ACTIVITY_TS = time.time()
+        if empty_batch:
+            EMPTY_BATCHES_SERVED += 1
 
 def _seconds_since_activity() -> float:
     with _ACT_LOCK:
         if LAST_BROWSER_ACTIVITY_TS <= 0:
             return 0.0
         return time.time() - LAST_BROWSER_ACTIVITY_TS
+
+def _empty_batches_served() -> int:
+    with _ACT_LOCK:
+        return EMPTY_BATCHES_SERVED
 
 # ========== 回调服务（CORS） ==========
 def _cors(h):
@@ -96,7 +106,9 @@ class Handler(BaseHTTPRequestHandler):
                     if not url: break
                     wid = extract_workshop_id(url)
                     if wid: ids.append(wid)
-            _touch_activity()
+            # 注意：这里要排除"首次握手探测" size=0 的请求，不然它也会被当成"空 batch"。
+            is_real_empty = (size > 0 and len(ids) == 0)
+            _touch_activity(empty_batch=is_real_empty)
             print(f"[BATCH] 返回 {len(ids)} 个 workshop ID")
             self.send_response(200); _cors(self)
             self.send_header("Content-Type","application/json"); self.end_headers()
@@ -502,30 +514,40 @@ def main():
                     print(f"[进度] 已完成: {st['done']}（成功:{st.get('ok',0)} 失败:{st.get('fail',0)}） | 队列剩余: {st['left']} | 已分配: {st['assigned']}")
                     last_done = st['done']
 
-            if st['left'] == 0 and st['assigned'] == st['done']:
-                # 队列空了且所有任务都完成了（浏览器扩展会主动上报 /report 的理想路径）
-                print(f"\n[完成] 所有任务已处理完毕！")
+            if st['left'] == 0 and st['assigned'] == st['done'] and st['done'] > 0:
+                # 最理想路径：浏览器扩展真的会为每条退订 POST /report（目前这种扩展不存在，
+                # 保留该路径给未来改进后的扩展使用）。
+                print(f"\n[完成] 所有任务已处理完毕（扩展已逐条回报）。")
                 print(f"[统计] 总计处理: {st['done']} 个项目（成功:{st.get('ok',0)} 失败:{st.get('fail',0)}）")
                 print(f"[提示] 请查看浏览器控制台确认实际成功/失败数量")
                 break
 
-            # 兜底：队列已排空 + 浏览器空闲超过 idle_timeout 秒 → 认为浏览器跑完了没回报，自动退出。
-            # 这样即使扩展不 POST /report，UI/调用者也能拿到 rc=0 终止子进程。
-            if idle_timeout > 0 and st['left'] == 0 and LAST_BROWSER_ACTIVITY_TS > 0:
-                idle_sec = _seconds_since_activity()
-                if not idle_notice_printed:
-                    print(f"[IDLE] 队列已清空，等待浏览器活动 / 上报（{idle_timeout}s 无活动则自动退出）…")
-                    idle_notice_printed = True
-                if idle_sec >= idle_timeout:
+            if st['left'] == 0:
+                # 主退出路径：队列已全部推送给浏览器。
+                # 只要 controller 已经对浏览器回应过至少一次 size>0 的空 /batch，就说明浏览器
+                # 已被告知"没更多活了"，controller 的使命就结束了——后续浏览器的实际退订动作
+                # 不再依赖本进程。直接退出，让调用方（UI）拿到 rc=0。
+                empties = _empty_batches_served()
+                if empties >= 1:
                     print(
-                        f"\n[完成] 队列已排空且浏览器 {int(idle_sec)}s 无活动，判定为已执行完毕，自动退出。"
+                        f"\n[完成] 全部 {st['assigned']} 个 workshop ID 已推送给浏览器，"
+                        f"且浏览器已确认无更多任务，controller 退出。"
                     )
-                    print(
-                        f"[统计] 分配: {st['assigned']}  已回报完成: {st['done']}"
-                        f"（成功:{st.get('ok',0)} 失败:{st.get('fail',0)}）"
-                    )
-                    print("[提示] 实际成功/失败以浏览器控制台为准。")
+                    print("[提示] 浏览器端的实际退订进度请看扩展 / 浏览器控制台（F12）。")
                     break
+
+                # 兜底：队列已空但浏览器没再来问 → 给 idle-timeout 秒宽限后直接退。
+                if idle_timeout > 0 and LAST_BROWSER_ACTIVITY_TS > 0:
+                    idle_sec = _seconds_since_activity()
+                    if not idle_notice_printed:
+                        print(f"[IDLE] 队列已清空，等待浏览器再轮询一次（{idle_timeout}s 无活动则自动退出）…")
+                        idle_notice_printed = True
+                    if idle_sec >= idle_timeout:
+                        print(
+                            f"\n[完成] 队列已排空且浏览器 {int(idle_sec)}s 无新活动，自动退出。"
+                        )
+                        print(f"[统计] 分配: {st['assigned']}（浏览器未逐条回报）")
+                        break
     except KeyboardInterrupt:
         st = QUEUE.stats()
         print(f"\n[EXIT] 用户中断")
