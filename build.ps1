@@ -9,8 +9,15 @@ if (-not (Test-Path -LiteralPath $pythonPath)) {
 & $pythonPath -m PyInstaller --noconfirm --distpath 'build\package' WEVideoTools.spec
 if ($LASTEXITCODE -ne 0) { throw 'PyInstaller 打包失败。' }
 $packagePath = Join-Path $PSScriptRoot 'dist\WEVideoTools'
+if ($ReleaseVersion) { $packagePath = Join-Path $PSScriptRoot 'build\package\WEVideoTools' }
 New-Item -ItemType Directory -Path $packagePath -Force | Out-Null
-Copy-Item -Path 'build\package\WEVideoTools\*' -Destination $packagePath -Recurse -Force
+if (-not $ReleaseVersion) {
+    $runtimePath = [System.IO.Path]::GetFullPath((Join-Path $packagePath '_internal'))
+    $expectedParent = [System.IO.Path]::GetFullPath($packagePath) + [System.IO.Path]::DirectorySeparatorChar
+    if (!$runtimePath.StartsWith($expectedParent, [System.StringComparison]::OrdinalIgnoreCase)) { throw 'Invalid runtime path.' }
+    if (Test-Path -LiteralPath $runtimePath) { Remove-Item -LiteralPath $runtimePath -Recurse -Force }
+    Copy-Item -Path 'build\package\WEVideoTools\*' -Destination $packagePath -Recurse -Force
+}
 foreach ($conflictingDll in @('_internal\icuuc.dll', '_internal\icudt78.dll')) {
     $dllPath = Join-Path $packagePath $conflictingDll
     if (Test-Path -LiteralPath $dllPath) { Remove-Item -LiteralPath $dllPath }
@@ -23,6 +30,6 @@ if (-not (Test-Path -LiteralPath $localConfig)) {
 New-Item -ItemType Directory -Path (Join-Path $packagePath 'output') -Force | Out-Null
 Write-Host "打包完成 $packagePath"
 if ($ReleaseVersion) {
-    & $pythonPath package_release.py --version $ReleaseVersion
+    & $pythonPath package_release.py --version $ReleaseVersion --package-dir $packagePath
     if ($LASTEXITCODE -ne 0) { throw 'Release 打包失败。' }
 }

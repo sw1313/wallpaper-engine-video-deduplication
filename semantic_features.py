@@ -134,13 +134,15 @@ class SemanticModel:
             )
 
         try:
+            from semantic_runtime import activate_runtime
+            activate_runtime()
             import torch  # noqa: F401
             import torch.nn.functional as F  # noqa: F401
         except ImportError as e:
             raise RuntimeError(
-                "启用语义特征需要安装 torch。参考：\n"
-                "  GPU (CUDA 12.x): pip install torch --index-url https://download.pytorch.org/whl/cu121\n"
-                "  CPU:            pip install torch --index-url https://download.pytorch.org/whl/cpu"
+                "启用语义特征需要安装语义组件。\n"
+                "便携版请在视频查重页点击“安装语义组件”。\n"
+                "源码版可运行 python -m pip install -r requirements-semantic.txt。"
             ) from e
 
         import torch

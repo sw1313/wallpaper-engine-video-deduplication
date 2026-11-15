@@ -14,13 +14,15 @@ Wallpaper Engine 创意工坊视频筛重 + 批量取消订阅 + **已下架物�
 
 下载 1.1.0 Release 中全部 `WEVideoTools-1.1.0-windows-x64.7z.*` 分卷，放在同一目录，用 7-Zip 打开 `.7z.001` 并解压。启动解压目录中的 `WEVideoTools.exe`。发布文件附有 SHA-256 校验表。[下载 Release](https://github.com/sw1313/wallpaper-engine-video-deduplication/releases/latest)
 
-便携版支持 Windows 10 / 11 x64，包含 Python 3.13、Qt 6、PyTorch、CUDA 13.0 运行库和 ffmpeg / ffprobe / fpcalc。推理设备默认 `auto`，根据硬件选择 CUDA 或 CPU。
+便携版支持 Windows 10 / 11 x64，包含 Python 3.13、Qt 6 与基础查重依赖。启动时会检查 ffmpeg、ffprobe 和可选的 fpcalc。请自行安装工具并加入 PATH，也可在界面填写对应程序的完整路径。
+
+启用语义特征前，点击「安装语义组件」，选择 CPU 或 CUDA 版本。安装器会从 PyPI 和 PyTorch 官方源下载依赖，校验加载成功后启用。依赖安装到程序目录的 `runtime/semantic/`，安装失败可重新操作并复用下载缓存。CUDA 版需要兼容 CUDA 13.0 的 NVIDIA 驱动。
 
 模型在首次使用语义特征时下载到 `models_cache/`，首次下载需要联网。使用基础 pHash、颜色直方图或音频指纹时，可关闭语义特征。
 
 首次启动请填写创意工坊目录与 WE 安装目录。Steam API Key 可在「下架归档」页填写。配置模板使用通用示例路径，输出目录 `output` 和模型缓存目录 `models_cache` 均相对于程序所在目录解析。
 
-升级时将新版解压到独立目录，再复制自己的 `config.toml`、`output/` 和 `models_cache/`。保留 `output/unsub_progress.sqlite3` 可继续之前的取消订阅任务，保留 `output/we_dedup_cache.sqlite3` 可复用已计算的签名。将 Tampermonkey 脚本更新到随包的 **20.2.0**。
+升级时将新版解压到独立目录，再复制自己的 `config.toml`、`output/`、`models_cache/` 和已安装的 `runtime/`。保留 `output/unsub_progress.sqlite3` 可继续之前的取消订阅任务，保留 `output/we_dedup_cache.sqlite3` 可复用已计算的签名。将 Tampermonkey 脚本更新到随包的 **20.2.0**。
 
 ### 1.1.0 更新内容
 
@@ -74,7 +76,7 @@ py -3.13 -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -r requirements-semantic.txt
 ```
 
-执行 `./build.ps1` 可重新打包，打包环境还需安装 `pyinstaller>=6.16`。通过 `./build.ps1 -ReleaseVersion 1.1.0` 可生成公开发布用的 7-Zip 分卷，需要 `7z` 命令位于 PATH 中。公开包从配置模板生成配置，包含运行程序与工具脚本。发布脚本会排除本机配置、输出数据和模型权重。
+执行 `./build.ps1` 可重新打包，打包环境还需安装 `pyinstaller>=6.16`。通过 `./build.ps1 -ReleaseVersion 1.1.0` 可生成公开发布用的 7-Zip 分卷，需要 `7z` 命令位于 PATH 中。公开包从配置模板生成配置，包含运行程序与工具脚本。发布脚本会排除本机配置、输出数据、语义运行库、外部工具和模型权重。
 
 界面通过侧栏切换三个功能，查重参数按组显示，支持中文名称与配置键搜索。鼠标悬停参数名称可查看详细说明。
 
@@ -381,6 +383,7 @@ DINO 的 per-frame 全局距离只能告诉你"两段视频差多少"，但分�
 ├── we_duplicate_finder_readonly.py   # 筛重核心脚本
 ├── we_delisted_archiver.py           # 下架检测 + 归档 + 按文件夹归档 + 生成退订 xlsx
 ├── semantic_features.py              # DINOv2/v3 加载与 patch 级空间裁决
+├── semantic_runtime.py               # 可选语义组件安装与加载
 ├── config.example.toml               # 配置模板（真实 config.toml 本地自建，已 .gitignore）
 ├── requirements.txt                  # Python 依赖
 ├── requirements-semantic.txt         # 语义特征依赖

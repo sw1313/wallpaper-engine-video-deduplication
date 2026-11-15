@@ -24,12 +24,13 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--version", required=True, help="Release version, for example 1.1.0")
     parser.add_argument("--seven-zip", default="7z", help="7-Zip executable")
+    parser.add_argument("--package-dir", type=Path, help="Directory containing the freshly built program")
     args = parser.parse_args()
     if not re.fullmatch(r"\d+\.\d+\.\d+(?:-[A-Za-z0-9.-]+)?", args.version):
         parser.error("Expected a semantic version")
 
     root = Path(__file__).resolve().parent
-    package = root / "dist" / "WEVideoTools"
+    package = args.package_dir or root / "dist" / "WEVideoTools"
     # A new directory prevents files from a previous release entering this one.
     stage_parent = Path(tempfile.mkdtemp(prefix=f"release-{args.version}-", dir=root / "build"))
     stage = stage_parent / "WEVideoTools"
@@ -40,6 +41,11 @@ def main() -> None:
         if not source.is_file():
             continue
         relative = source.relative_to(package)
+        if any(part.lower() in {"torch", "torchvision", "transformers", "modelscope", "safetensors",
+                                "huggingface_hub", "tokenizers", "tools"} for part in relative.parts):
+            raise RuntimeError(f"Optional component found in core runtime: {relative}")
+        if source.name.lower() in {"ffmpeg.exe", "ffprobe.exe", "fpcalc.exe"}:
+            raise RuntimeError(f"External tool found in core runtime: {relative}")
         if "__pycache__" in relative.parts or source.suffix.lower() in WEIGHT_SUFFIXES:
             continue
         if source.name in {"pytorch_model.bin", "model.bin"} or source.suffix.lower() in {".log", ".sqlite3"}:
@@ -65,7 +71,9 @@ def main() -> None:
         "Wallpaper Engine 视频去重工具 " + args.version + "\n\n"
         "运行 WEVideoTools.exe，并保留完整目录。\n"
         "首次启动请填写创意工坊目录和 Wallpaper Engine 安装目录。\n"
-        "模型在首次使用语义特征时下载到 models_cache。\n"
+        "启动时检查 ffmpeg、ffprobe 和可选的 fpcalc。请自行安装并配置 PATH 或程序路径。\n"
+        "启用语义特征前，点击安装语义组件，选择 CPU 或 CUDA 版本。\n"
+        "语义运行库安装在 runtime/semantic，模型首次使用时下载到 models_cache。\n"
         "output 保存筛重数据库、结果表和取消订阅重试进度。\n"
         "批量取消订阅需要浏览器登录 Steam，并安装随包的 Tampermonkey 脚本。\n"
         "创意工坊归档识别补丁的安装、重装和还原方法见 README.md。\n\n"

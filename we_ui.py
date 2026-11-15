@@ -448,6 +448,45 @@ class App(QMainWindow):
         self._load_config_into_form(Path(self.dedup_config_path.text()))
         self._dedup_fields["we_install_dir"].textChanged.connect(self.arc_we_install_dir.setText)
         self.arc_we_install_dir.textChanged.connect(self._dedup_fields["we_install_dir"].setText)
+        QTimer.singleShot(0, self._check_dependencies)
+
+    def _check_dependencies(self) -> None:
+        states = []
+        for name in ("ffmpeg", "ffprobe", "fpcalc"):
+            configured = str(self._field_value(name + "_path")).strip() or name
+            found = shutil.which(_which(configured)) is not None
+            states.append(f"{name} {'已找到' if found else '待安装'}")
+        from semantic_runtime import runtime_ready
+        if getattr(sys, "frozen", False):
+            states.append("语义组件已安装" if runtime_ready() else "语义组件按需安装")
+        self.dependency_status.setText(" · ".join(states))
+
+    def _install_semantic_components(self, continue_dedup: bool = False) -> None:
+        if self.proc and self.proc.popen.poll() is None:
+            QMessageBox.warning(self, "正在运行", "请等待当前任务结束后安装组件。")
+            return
+        prompt = QMessageBox(self)
+        prompt.setWindowTitle("安装语义组件")
+        prompt.setText("请选择语义运行库。组件将下载到程序目录的 runtime/semantic，模型在首次分析时下载。CUDA 版下载量较大。")
+        cpu = prompt.addButton("CPU 组件", QMessageBox.ButtonRole.AcceptRole)
+        cuda = prompt.addButton("CUDA 组件", QMessageBox.ButtonRole.AcceptRole)
+        prompt.addButton(QMessageBox.StandardButton.Cancel)
+        prompt.exec()
+        clicked = prompt.clickedButton()
+        if clicked not in (cpu, cuda):
+            return
+        device = "cpu" if clicked is cpu else "cuda"
+        self._field_set("semantic_feature_device", "cpu" if device == "cpu" else "auto")
+        cmd = [sys.executable, str(REPO_ROOT / "semantic_runtime.py"), "--install", device]
+
+        def complete(code: Optional[int]) -> None:
+            def update() -> None:
+                self._check_dependencies()
+                if code == 0 and continue_dedup:
+                    self._run_dedup()
+            self._call_on_ui_thread(update)
+
+        self._start_process(cmd, cwd=REPO_ROOT, sink=self.log_dedup, on_finish=complete)
 
     def _refresh_task_status(self) -> None:
         running = bool(self._archive_query_token is not None or (self.proc and self.proc.popen.poll() is None))
@@ -782,6 +821,19 @@ class App(QMainWindow):
         btn_save_as.clicked.connect(self._save_config_as)
         top.addWidget(btn_save_as)
         outer.addLayout(top)
+
+        dependencies = QHBoxLayout()
+        self.dependency_status = QLabel()
+        self.dependency_status.setWordWrap(True)
+        dependencies.addWidget(self.dependency_status, 1)
+        check_dependencies = QPushButton("检查依赖")
+        check_dependencies.clicked.connect(self._check_dependencies)
+        dependencies.addWidget(check_dependencies)
+        install_semantics = QPushButton("安装语义组件")
+        install_semantics.setProperty("taskAction", True)
+        install_semantics.clicked.connect(lambda: self._install_semantic_components())
+        dependencies.addWidget(install_semantics)
+        outer.addLayout(dependencies)
 
         # 中部：左右分栏 —— 左边表单（可滚动），右边日志
         splitter = QSplitter(Qt.Orientation.Horizontal)
@@ -1208,6 +1260,19 @@ class App(QMainWindow):
         if not cfg.get("workshop_root"):
             QMessageBox.critical(self, "参数缺失", "请填写 workshop_root（创意工坊目录）。")
             return
+
+        missing = [name for name in ("ffmpeg", "ffprobe")
+                   if shutil.which(_which(str(cfg.get(name + "_path", name)))) is None]
+        if missing:
+            QMessageBox.critical(self, "缺少外部工具",
+                                 "请先安装 " + "、".join(missing) +
+                                 "，并加入 PATH 或填写对应程序路径。\n下载地址 https://ffmpeg.org/download.html")
+            return
+        if getattr(sys, "frozen", False) and cfg.get("semantic_feature_enabled"):
+            from semantic_runtime import runtime_ready
+            if not runtime_ready():
+                self._install_semantic_components(continue_dedup=True)
+                return
 
         tmp_dir = Path(tempfile.gettempdir()) / "we_dedup_ui"
         tmp_dir.mkdir(parents=True, exist_ok=True)

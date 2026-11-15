@@ -24,6 +24,7 @@ config.toml
 
 # 模型权重缓存（DINOv2 / DINOv3 动辄数百 MB）
 models_cache/
+runtime/
 
 # 日志
 *.log
