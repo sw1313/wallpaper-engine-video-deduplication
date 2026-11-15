@@ -494,7 +494,7 @@ class SigCache:
     def _key(p: Path) -> str:
         """
         Windows 文件系统大小写不敏感，而 Path.resolve() 返回的 UNC/盘符大小写依赖访问路径
-        （`\\\\CS382\\...` vs `\\\\cs382\\...`），会被 SQLite 当成两个主键，造成同一视频重复 row、
+        （`\\\\SERVER\\...` vs `\\\\server\\...`），会被 SQLite 当成两个主键，造成同一视频重复 row、
         命中时拉到残缺的半份数据。统一 lower() 消除此抖动。
         """
         try:
@@ -695,6 +695,82 @@ class SigCache:
                 (key, int(size), int(mtime_ns), item_id, url, blob, semantic_patch_cfg_hash, int(time.time())),
             )
         self._maybe_checkpoint()
+
+    def mirror_row(self, src_path: Path, dst_path: Path,
+                   size: int, mtime_ns: int, item_id: str, url: str) -> bool:
+        """把 src_path 缓存行的全部特征字段整条镜像到 dst_path。
+
+        用途：workshop → myprojects 归档后两条路径字节级一致，但在缓存里是两条
+        独立记录。首次扫描到 myprojects 侧时，用本方法把 workshop 已算好的
+        duration / pHash / 颜色 / 音频 / 语义 / patch 全部搬过来，彻底跳过重算。
+
+        item_id / url 按目标路径的身份写入（workshop 是纯数字，myprojects 是
+        "mp:"前缀；两者在 dedup 阶段仍是两个独立条目，不会被合并成一份）。
+        成功镜像返回 True；src 没有记录或主键冲突返回 False。
+        """
+        src_key = self._key(src_path)
+        dst_key = self._key(dst_path)
+        if src_key == dst_key:
+            return False
+        with self.lock:
+            cur = self.conn.execute(
+                "SELECT duration, phash_digest, phash_parts_json, visual_cfg_hash, "
+                "audio_fp_digest, audio_fp_raw, audio_cfg_hash, "
+                "color_histogram_json, "
+                "semantic_embeddings_blob, semantic_cfg_hash, "
+                "semantic_patch_blob, semantic_patch_cfg_hash "
+                "FROM file_cache WHERE path=?",
+                (src_key,),
+            )
+            row = cur.fetchone()
+        if not row:
+            return False
+        (duration, phash_digest, phash_parts_json, visual_cfg_hash,
+         audio_fp_digest, audio_fp_raw, audio_cfg_hash,
+         color_histogram_json,
+         semantic_embeddings_blob, semantic_cfg_hash,
+         semantic_patch_blob, semantic_patch_cfg_hash) = row
+        with self.lock, self.conn:
+            self.conn.execute(
+                """
+                INSERT INTO file_cache(
+                    path, size, mtime_ns, item_id, url, duration,
+                    phash_digest, phash_parts_json, visual_cfg_hash,
+                    audio_fp_digest, audio_fp_raw, audio_cfg_hash,
+                    color_histogram_json,
+                    semantic_embeddings_blob, semantic_cfg_hash,
+                    semantic_patch_blob, semantic_patch_cfg_hash,
+                    updated_ts
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(path) DO UPDATE SET
+                    size=excluded.size,
+                    mtime_ns=excluded.mtime_ns,
+                    item_id=excluded.item_id,
+                    url=excluded.url,
+                    duration=excluded.duration,
+                    phash_digest=excluded.phash_digest,
+                    phash_parts_json=excluded.phash_parts_json,
+                    visual_cfg_hash=excluded.visual_cfg_hash,
+                    audio_fp_digest=excluded.audio_fp_digest,
+                    audio_fp_raw=excluded.audio_fp_raw,
+                    audio_cfg_hash=excluded.audio_cfg_hash,
+                    color_histogram_json=excluded.color_histogram_json,
+                    semantic_embeddings_blob=excluded.semantic_embeddings_blob,
+                    semantic_cfg_hash=excluded.semantic_cfg_hash,
+                    semantic_patch_blob=excluded.semantic_patch_blob,
+                    semantic_patch_cfg_hash=excluded.semantic_patch_cfg_hash,
+                    updated_ts=excluded.updated_ts
+                """,
+                (dst_key, int(size), int(mtime_ns), item_id, url, duration,
+                 phash_digest, phash_parts_json, visual_cfg_hash,
+                 audio_fp_digest, audio_fp_raw, audio_cfg_hash,
+                 color_histogram_json,
+                 semantic_embeddings_blob, semantic_cfg_hash,
+                 semantic_patch_blob, semantic_patch_cfg_hash,
+                 int(time.time())),
+            )
+        self._maybe_checkpoint()
+        return True
 
     # —— LLM 文本仲裁判决缓存 ——
 
@@ -922,6 +998,81 @@ def make_item_url(item_id: str, video_path: Path) -> str:
         except Exception:
             return str(video_path.resolve())
     return make_we_url(item_id)
+
+
+def _twin_paths(vp: Path, cfg: "Config") -> List[Path]:
+    """返回文件在"另一侧"的孪生路径（workshop ↔ myprojects 互为镜像）。
+
+    场景：下架物品通过 we_delisted_archiver 从 `<workshop_root>/<wid>/…` 整个目录
+    copytree 到 `<we_install>/projects/myprojects/<wid>/…`，两侧字节完全一致。
+    dedup 默认会把同一个视频在两个路径都扫进来（分别得到 item_id `<wid>` 和
+    `mp:<wid>`，以保持"两个独立条目"的筛重语义），但特征值完全可以共享。
+    本函数枚举"当前路径在另一侧对应的路径"，供缓存命中时做 fallback 查询。
+    """
+    ws_root_str = str(getattr(cfg, "workshop_root", "") or "").strip()
+    we_root_str = str(getattr(cfg, "we_install_dir", "") or "").strip()
+    if not ws_root_str or not we_root_str:
+        return []
+    try:
+        ws_root = Path(ws_root_str).resolve()
+        we_root = Path(we_root_str).resolve()
+    except Exception:
+        return []
+    mp_root = we_root / "projects" / "myprojects"
+    try:
+        abs_vp = vp.resolve()
+    except Exception:
+        abs_vp = vp
+    out: List[Path] = []
+    # workshop → myprojects
+    try:
+        rel = abs_vp.relative_to(ws_root)
+        out.append(mp_root / rel)
+    except ValueError:
+        pass
+    # myprojects → workshop
+    try:
+        rel = abs_vp.relative_to(mp_root)
+        out.append(ws_root / rel)
+    except ValueError:
+        pass
+    return out
+
+
+def _cache_get_with_twin(vp: Path, size: int, mtime_ns: int,
+                          item_id: str, url: str,
+                          cfg: "Config") -> Tuple[Optional[Dict[str, object]], bool]:
+    """主路径缓存未命中时回退到孪生路径查询；命中后把整行镜像到主路径。
+
+    返回 (row, twin_hit)：
+      - row：要么是主路径命中结果，要么是孪生命中后镜像的结果（此时 twin_hit=True）。
+      - twin_hit：True 表示本次是靠孪生路径救回来的，调用方可以打 INFO 日志提示。
+    主路径本来就命中或完全找不到缓存时 twin_hit=False。
+    """
+    if _CACHE is None:
+        return None, False
+    row = _CACHE.get_row(vp, size, mtime_ns)
+    if row is not None:
+        return row, False
+    twin_hit = False
+    for tp in _twin_paths(vp, cfg):
+        try:
+            # get_row 只按 size 匹配（见该方法 docstring），mtime_ns 传 0 即可；
+            # 孪生路径可能根本没在当前运行扫过，它的 mtime_ns 只在自己行里有意义。
+            twin_row = _CACHE.get_row(tp, size, 0)
+        except Exception:
+            twin_row = None
+        if twin_row is None:
+            continue
+        try:
+            if _CACHE.mirror_row(tp, vp, size, mtime_ns, item_id, url):
+                row = twin_row
+                twin_hit = True
+                break
+        except Exception as e:
+            LOGGER.debug("[cache] mirror_row failed: %s", e)
+    return row, twin_hit
+
 
 def middle_window_start(duration: Optional[float], window: float, ratio: float) -> float:
     """计算以 ratio 为中心的窗口起点（ratio∈[0,1]；0=开头，0.5=中点，1=结尾）。"""
@@ -1272,8 +1423,9 @@ def measure_duration_one(item_id: str, vp: Path, cfg: Config) -> DurationRec:
         mtime_ns = 0
 
     # 断点续跑：优先用缓存的 duration（仅当文件仍存在且未变），bucket 每次按当前配置重算
+    # 主路径 miss 时顺带查 workshop↔myprojects 孪生路径（归档产生的字节级拷贝）
     if _CACHE and size and mtime_ns:
-        row = _CACHE.get_row(vp, size, mtime_ns)
+        row, twin_hit = _cache_get_with_twin(vp, size, mtime_ns, item_id, url, cfg)
         if row and row.get("duration") is not None:
             if vp.exists():
                 try:
@@ -1281,6 +1433,8 @@ def measure_duration_one(item_id: str, vp: Path, cfg: Config) -> DurationRec:
                     if st2.st_size == size and getattr(st2, "st_mtime_ns", int(st2.st_mtime * 1e9)) == mtime_ns:
                         dur = float(row["duration"]) if row["duration"] is not None else None
                         bucket = nearest_bucket(dur, cfg.duration_rounding)
+                        if twin_hit:
+                            LOGGER.debug("[dur] %s 命中孪生缓存（workshop↔myprojects）", item_id)
                         return DurationRec(item_id=item_id, path=vp, size=size, duration=dur, bucket=bucket, url=url)
                 except Exception:
                     pass
@@ -1399,7 +1553,13 @@ def sign_one(rec: DurationRec, cfg: Config) -> FileSig:
     need_audio = bool(cfg.require_both_signatures) or bool(cfg.audio_merge_override_color)
 
     if _CACHE and rec.size and mtime_ns and rec.path.exists():
-        row = _CACHE.get_row(rec.path, rec.size, mtime_ns)
+        # 主路径 miss 时顺带查 workshop↔myprojects 孪生路径（归档产生的字节级拷贝），
+        # 命中即把整行镜像到主路径，下次扫描直接主路径命中
+        row, twin_hit = _cache_get_with_twin(
+            rec.path, rec.size, mtime_ns, rec.item_id, rec.url, cfg,
+        )
+        if twin_hit:
+            LOGGER.info("%s 命中孪生路径缓存（workshop↔myprojects 归档拷贝，跳过重算）", prefix)
         if row:
             if (row.get("visual_cfg_hash") == visual_hash
                     and row.get("phash_digest") and row.get("phash_parts_json")
@@ -3176,6 +3336,7 @@ def main():
             item_to_bestsize: Dict[str, int] = {}
             item_to_url: Dict[str, str] = {}
             item_to_folder: Dict[str, str] = {}
+            item_to_mtime_ns: Dict[str, int] = {}
             for fs in group:
                 if fs.item_id not in item_to_bestsize or fs.size > item_to_bestsize[fs.item_id]:
                     item_to_bestsize[fs.item_id] = fs.size
@@ -3185,16 +3346,29 @@ def main():
                         item_to_folder[fs.item_id] = str(fs.path.parent.resolve())
                     except Exception:
                         item_to_folder[fs.item_id] = str(fs.path.parent)
+                    # 同 size 时比"谁更旧"，取代表文件（=最大 size 那份）的 mtime。
+                    # 读不到 mtime（文件已被退订删掉？）就落 0——在降序 -mtime 里会排到最后，
+                    # 反正 mtime 只在 size+is_mp 完全打平时才起作用，极少数 fallback 没影响。
+                    try:
+                        item_to_mtime_ns[fs.item_id] = fs.path.stat().st_mtime_ns
+                    except OSError:
+                        item_to_mtime_ns[fs.item_id] = 0
             if len(item_to_bestsize) <= 1:
                 continue
-            # 首列 = 取消订阅流程中保留的那份。按文件大小降序；size 相等时
-            # myprojects（item_id 以 "mp:" 开头）优先排前，这样同分辨率同码率的
-            # workshop+myprojects 会把 myprojects 作为保留项，被退订的永远是
-            # 还没归档的 workshop 那份。
-            def _dup_sort_key(kv: Tuple[str, int]) -> Tuple[int, int]:
+            # 首列 = 取消订阅流程中保留的那份。优先级：
+            #   1) 文件大，
+            #   2) myprojects（item_id 以 "mp:" 开头）优先，这样同分辨率同码率的
+            #      workshop+myprojects 会把 myprojects 作为保留项，被退订的永远是
+            #      还没归档的 workshop 那份；
+            #   3) 大小 + myprojects 都打平时，文件旧的优先（= 先订阅的那份），
+            #      避免"新订的覆盖老的"，典型场景是连着订了同一套素材的两个版本。
+            #
+            # sorted(reverse=True) 要让"赢家"的 key 更大：文件越旧（mtime 越小）
+            # 反而要对应更大的 key，所以用 -mtime_ns。
+            def _dup_sort_key(kv: Tuple[str, int]) -> Tuple[int, int, int]:
                 iid, sz = kv
                 is_mp = 1 if iid.startswith("mp:") else 0
-                return (sz, is_mp)
+                return (sz, is_mp, -item_to_mtime_ns.get(iid, 0))
             ordered = sorted(item_to_bestsize.items(), key=_dup_sort_key, reverse=True)
             urls = [item_to_url[iid] for iid, _ in ordered]
             folders = [item_to_folder[iid] for iid, _ in ordered]

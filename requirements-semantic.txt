@@ -1,0 +1,6 @@
+-r requirements.txt
+torch>=2.7,<3
+torchvision>=0.22,<1
+transformers>=4.56,<6
+modelscope>=1.28,<2
+safetensors>=0.6,<1

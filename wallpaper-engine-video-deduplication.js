@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Steam Workshop 取消订阅·固定池轮转（server/local兼容）+ 错误页面处理 + 单页面模式
 // @namespace    local.bulk-unsub
-// @version      20.0.0
+// @version      20.2.0
 // @description  自动退订（URL 含 #bulk_unsub=1）+ 订阅主页 postMessage 投递队列 + ★新增：油猴菜单“手动取消订阅…（输入ID）”，方便取消已下架物品。
 // @match        https://steamcommunity.com/sharedfiles/filedetails/*
 // @match        https://steamcommunity.com/my/myworkshopfiles*
@@ -36,14 +36,42 @@
   }
   const API_NEXT = (function(){
     const cb = parseHashParam('cb');
-    return cb && /^https?:\/\//i.test(cb) ? cb : 'http://127.0.0.1:8787/next';
+    if (cb && /^https?:\/\//i.test(cb)) return cb;
+    const base = parseHashParam('unsub_base') || parseHashParam('api_base');
+    const key = parseHashParam('unsub_key') || parseHashParam('key');
+    if (base && key) {
+      const b = String(base).replace(/\/+$/, '');
+      return `${b}/unsub/next?key=${encodeURIComponent(String(key))}`;
+    }
+    return 'http://127.0.0.1:8787/next';
   })();
+  let DURABLE_BACKEND = false;
+  let ACTIVE_JOB_ID = parseHashParam('job') || '';
+  let SESSION_EXPIRED = false;
+  let COMPLETED_PROGRESS = null;
+  const LEASE_TOKENS = new Map();
+  const REPORT_STORAGE = 'bulk_unsub_pending_reports_v1';
+
+  function pendingReports(){
+    try { return JSON.parse(localStorage.getItem(REPORT_STORAGE) || '{}'); }
+    catch (_) { return {}; }
+  }
+
+  function storeReport(key, report){
+    try {
+      const reports = pendingReports();
+      if (report) reports[key] = report;
+      else delete reports[key];
+      localStorage.setItem(REPORT_STORAGE, JSON.stringify(reports));
+    } catch (_) {}
+  }
 
   function buildBatchUrl(apiNext, size){
     try{
       const u = new URL(String(apiNext));
       u.pathname = u.pathname.replace(/\/next\/?$/i, "/batch");
       u.searchParams.set("size", String(size));
+      if (ACTIVE_JOB_ID) u.searchParams.set('job', ACTIVE_JOB_ID);
       return u.toString();
     }catch(_){
       const base = String(apiNext||"").replace("/next", "/batch");
@@ -60,6 +88,98 @@
     }catch(_){
       return String(apiNext||"").replace("/next", "/report");
     }
+  }
+
+  function unsubSessionKey(){
+    try{
+      const u = new URL(String(API_NEXT || ""));
+      const k = u.searchParams.get("key");
+      if (k) return String(k).split("?", 1)[0].trim();
+    }catch(_){}
+    return String(parseHashParam("unsub_key") || parseHashParam("key") || "").trim();
+  }
+
+  function unsubDeadStorageKey(){
+    const k = unsubSessionKey();
+    return k ? ("bulk_unsub_dead_" + k) : "";
+  }
+
+  function isUnsubSessionDead(){
+    if (SESSION_EXPIRED) return true;
+    try{
+      const sk = unsubDeadStorageKey();
+      return !!(sk && sessionStorage.getItem(sk) === "1");
+    }catch(_){
+      return false;
+    }
+  }
+
+  function markUnsubSessionDead(){
+    SESSION_EXPIRED = true;
+    try{
+      const sk = unsubDeadStorageKey();
+      if (sk) sessionStorage.setItem(sk, "1");
+    }catch(_){}
+  }
+
+  function parseBatchResponse(res){
+    let data = {};
+    try{ data = JSON.parse(res.responseText || "{}"); }catch(_){}
+    const st = Number(res.status) || 0;
+    const expired = !!data.expired || st === 410 || st === 404 || st === 409;
+    if (data.durable) {
+      DURABLE_BACKEND = true;
+      if (ACTIVE_JOB_ID !== String(data.job || ACTIVE_JOB_ID)) COMPLETED_PROGRESS = null;
+      ACTIVE_JOB_ID = String(data.job || ACTIVE_JOB_ID);
+      for (const task of (data.tasks || [])) LEASE_TOKENS.set(String(task.id), task.token);
+    }
+    return {
+      ...data,
+      ids: data.mode === 'multi' ? null : (data.ids && Array.isArray(data.ids) ? data.ids.map(String) : []),
+      expired,
+      offline: st !== 200,
+    };
+  }
+
+  async function reportUnsubProgress(id, success, detail = {}){
+    if (!API_NEXT || !/^https?:\/\//i.test(String(API_NEXT))) return false;
+    const report = { id, status: success ? 'ok' : 'fail', ok: !!success,
+      reason: detail.reason || '', job: detail.job || ACTIVE_JOB_ID,
+      token: detail.token || LEASE_TOKENS.get(String(id)) || parseHashParam('attempt') || '' };
+    const key = report.job + ':' + id + ':' + report.token;
+    if (DURABLE_BACKEND) storeReport(key, report);
+    for (let attempt = 0; attempt < 3; attempt++) {
+      if (isUnsubSessionDead()) return false;
+      try{
+      const delivered = await new Promise(res=>{
+        GM_xmlhttpRequest({
+          method:"POST",
+          url: buildReportUrl(API_NEXT),
+          headers:{ "Content-Type":"application/json" },
+          data: JSON.stringify(report),
+          onload: response=>{
+            if (response.status === 409 || response.status === 410) markUnsubSessionDead();
+            if (response.status === 200) {
+              try {
+                const data = JSON.parse(response.responseText || '{}');
+                if (data.complete && data.progress) COMPLETED_PROGRESS = data.progress;
+              } catch (_) {}
+            }
+            res(response.status === 200);
+          },
+          onerror: ()=>res(false),
+          ontimeout: ()=>res(false),
+          timeout: 2000
+        });
+      });
+      if (delivered) {
+        if (DURABLE_BACKEND) storeReport(key, null);
+        return true;
+      }
+      }catch(_){}
+      await new Promise(resolve=>setTimeout(resolve, 500));
+    }
+    return false;
   }
 
   const D = document;
@@ -103,7 +223,7 @@
     ? String(parseHashParam('appid_default'))
     : '431960';
 
-  // 极速模式：不验证、不重试（只按接口返回判定成功/失败）
+  // 极速模式每次只发一次 API 请求，本机持久化队列负责失败后的重试。
   // - 默认开启（fast=1）
   // - 想启用验证/重试：#bulk_unsub=1&fast=0
   const FAST_MODE = /^(1|true|yes)$/i.test(String(parseHashParam('fast') || '1'));
@@ -151,6 +271,13 @@
     }
   }
 
+  function unsubscribeResponseSucceeded(text){
+    try {
+      const value = JSON.parse(String(text || '').trim());
+      return value === 1 || value === true || !!(value && (value.success === 1 || value.success === true || value.success === '1'));
+    } catch (_) { return false; }
+  }
+
   // 直接通过API取消订阅（用于错误页面）
   // 返回 { success: boolean, verified: boolean, reason?: string }
   async function unsubscribeByAPI(id, appid, retries = 3, fastOverride = null){
@@ -172,13 +299,7 @@
         formData.append('sessionid', String(sessionid));
         const {status, text} = await xhrText('POST', 'https://steamcommunity.com/sharedfiles/unsubscribe', formData, 15000);
         if (status !== 200) return { success: false, verified: false, reason: `http_${status}` };
-        let ok = false;
-        try{
-          const j = JSON.parse(text || '{}');
-          ok = (j && (j.success === 1 || j.success === true));
-        }catch(_){
-          ok = (text === '' || text === '1' || text === 'true');
-        }
+        const ok = unsubscribeResponseSucceeded(text);
         return ok
           ? { success: true, verified: false, reason: 'fast' }
           : { success: false, verified: false, reason: 'bad_response' };
@@ -206,13 +327,7 @@
         if (status !== 200) throw new Error(`http_${status}`);
 
         // 兼容多种返回：JSON / "1" / 空串
-        let ok = false;
-        try{
-          const j = JSON.parse(text || '{}');
-          ok = (j && (j.success === 1 || j.success === true));
-        }catch(_){
-          ok = (text === '' || text === '1' || text === 'true');
-        }
+        const ok = unsubscribeResponseSucceeded(text);
         if (!ok) throw new Error('bad_response');
 
         // 3) 等待 Steam 侧写入（对已下架物品可能更慢）
@@ -241,7 +356,7 @@
           continue;
         }
         console.error('[API] ✗ 验证失败，该项目可能仍占用配额!', id);
-        return { success: true, verified: false, reason: 'still_subscribed' };
+        return { success: false, verified: false, reason: 'still_subscribed' };
 
       } catch(err) {
         console.warn(`[API] 重试 ${attempt + 1}/${retries} 失败:`, id, err.message);
@@ -323,6 +438,8 @@
   // 全局变量：单页面模式标记
   let SINGLE_PAGE_MODE = false;
   let PROCESSING = false;
+  /** 探测 /batch?size=0 时若旧服务端误返回 id，先缓存避免丢任务 */
+  let SINGLE_PAGE_BOOT_IDS = [];
 
   // ========== WebUI 投递队列（postMessage） ==========
   // WebUI 会在「已订阅物品主页」postMessage {type:'bulk_unsub_add', ids:[...], reqId}
@@ -375,18 +492,7 @@
 
         // 若 API_NEXT 指向本机 controller，则上报进度（/report 不会弹出队列）
         try{
-          await new Promise(res=>{
-            GM_xmlhttpRequest({
-              method:"POST",
-              url: buildReportUrl(API_NEXT),
-              headers:{ "Content-Type":"application/json" },
-              data: JSON.stringify({ id, status: success ? "ok" : "fail", ok: success }),
-              onload: ()=>res(null),
-              onerror: ()=>res(null),
-              ontimeout: ()=>res(null),
-              timeout: 2000
-            });
-          });
+          await reportUnsubProgress(id, success);
         }catch(_){}
 
         // 逐个 ID 更新各 reqId 的完成度，全部完成后给 opener 回执 bulk_unsub_done
@@ -464,7 +570,8 @@
         url: location.href,
         id: getWorkshopId(),
         appid: getAppId(),
-        status, ts: Date.now()
+        status, ts: Date.now(), job: ACTIVE_JOB_ID,
+        token: parseHashParam('attempt') || ''
       };
       GM_xmlhttpRequest({
         method:'POST',
@@ -671,9 +778,205 @@
     return window.name;
   }
 
+  function isWebUiSubsWaitBackend(){
+    if (parseHashParam('unsub_key') || parseHashParam('unsub_base')) return true;
+    const api = String(API_NEXT || '');
+    return /\/unsub\/next/i.test(api) && !/^https?:\/\/127\.0\.0\.1:8787\//i.test(api);
+  }
+
+  function fetchBatchIdsPromise(batchSize){
+    if (isUnsubSessionDead()) return Promise.resolve({ ids: [], expired: true });
+    const batchUrl = buildBatchUrl(API_NEXT, batchSize);
+    return new Promise((resolve)=>{
+      GM_xmlhttpRequest({
+        method: 'GET',
+        url: batchUrl,
+        onload: function(res){
+          const parsed = parseBatchResponse(res);
+          if (parsed.expired) markUnsubSessionDead();
+          resolve(parsed);
+        },
+        onerror: ()=> resolve({ ids: [], expired: false, offline: true }),
+        ontimeout: ()=> resolve({ ids: [], expired: false, offline: true }),
+        timeout: 5000
+      });
+    });
+  }
+
+  function showUnsubSessionExpired(reason){
+    markUnsubSessionDead();
+    const msg = reason || 'WebUI 退订会话已失效（服务可能已重启）。请回到 WebUI 重新发起批量取消订阅。';
+    console.warn('[bulk_unsub]', msg);
+    try{
+      let el = document.getElementById('bulk-unsub-progress');
+      if (!el){
+        el = document.createElement('div');
+        el.id = 'bulk-unsub-progress';
+        el.style.cssText = 'position:fixed;top:10px;right:10px;padding:15px 20px;background:rgba(244,67,54,0.95);color:#fff;border-radius:8px;box-shadow:0 4px 12px rgba(0,0,0,0.3);z-index:99999;font-family:Arial,sans-serif;font-size:14px;max-width:360px;line-height:1.5;';
+        document.body.appendChild(el);
+      }
+      el.innerHTML = '<div style="font-weight:bold;margin-bottom:8px;">⚠ 退订会话已失效</div><div style="font-size:13px;">' + msg + '</div>';
+    }catch(_){}
+  }
+
+  async function processDurableQueue(){
+    if (PROCESSING) return;
+    PROCESSING = true;
+    function normalizeWorkers(value){
+      const number = Number(value);
+      return Number.isFinite(number) && value !== '' ? Math.max(1, Math.min(16, Math.trunc(number))) : 8;
+    }
+    let workers = normalizeWorkers(parseHashParam('workers'));
+    const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+    let gap = 50;
+    let nextStart = 0;
+    let cooldownUntil = 0;
+    let successes = 0;
+    let lastSlowdown = 0;
+    let gate = Promise.resolve();
+    const active = new Set();
+    let reportsBlocked = false;
+    let loginRequired = false;
+    const panel = document.createElement('div');
+    panel.id = 'bulk-unsub-progress';
+    panel.style.cssText = 'position:fixed;top:10px;right:10px;padding:16px 20px;background:#172d3b;color:white;border-radius:8px;z-index:99999;font:14px sans-serif;max-width:380px;line-height:1.6';
+    const workerLabel = document.createElement('label');
+    workerLabel.textContent = '并发数 ';
+    const workerInput = document.createElement('input');
+    workerInput.type = 'number';
+    workerInput.min = '1';
+    workerInput.max = '16';
+    workerInput.value = String(workers);
+    workerInput.title = '新值应用于后续请求，范围 1–16';
+    workerInput.setAttribute('aria-label', '退订并发数');
+    workerInput.style.cssText = 'width:60px;margin:0 0 10px 8px;padding:4px;border-radius:4px;color:#172d3b;background:white;border:1px solid #9cb1bf';
+    workerInput.addEventListener('change', () => {
+      workers = normalizeWorkers(workerInput.value);
+      workerInput.value = String(workers);
+    });
+    workerLabel.appendChild(workerInput);
+    const status = document.createElement('div');
+    panel.appendChild(workerLabel);
+    panel.appendChild(status);
+    document.body.appendChild(panel);
+    const show = text => { status.textContent = text; console.log('[持久化队列]', text); };
+    const showFinished = progress => show(`本轮结束。成功 ${progress.ok || 0}，失败 ${progress.fail || 0}。失败及未确认项目已记录，再次运行可继续。`);
+
+    function waitForStart(){
+      const ticket = gate.then(async () => {
+        let wait;
+        while ((wait = Math.max(nextStart, cooldownUntil) - Date.now()) > 0) await sleep(wait);
+        nextStart = Date.now() + gap;
+      });
+      gate = ticket.catch(() => {});
+      return ticket;
+    }
+
+    async function processTask(task, job){
+      await waitForStart();
+      if (isUnsubSessionDead() || loginRequired) return;
+      let result;
+      try {
+        result = await unsubscribeByAPI(task.id, DEFAULT_APPID, FAST_MODE ? 1 : 3);
+      } catch (error) {
+        result = { success: false, reason: String(error && error.message || error) };
+      }
+      if (result.success) {
+        successes++;
+        if (successes % 5 === 0) gap = Math.max(50, Math.floor(gap * 0.85));
+      } else {
+        successes = 0;
+        const now = Date.now();
+        if (now - lastSlowdown >= 1000) {
+          gap = Math.min(2000, gap * 2);
+          lastSlowdown = now;
+        }
+        if (/429|503|timeout|network/i.test(result.reason || '')) {
+          cooldownUntil = Math.max(cooldownUntil, Date.now() + 10000);
+          show('请求受限或网络异常，正在降低速度并等待重试…');
+        }
+        if (/no_sessionid|http_401|http_403/.test(result.reason || '')) loginRequired = true;
+      }
+      const delivered = await reportUnsubProgress(task.id, !!result.success, { ...result, token: task.token, job });
+      if (!delivered) reportsBlocked = true;
+    }
+
+    try {
+      while (true) {
+        if (isUnsubSessionDead()) { showUnsubSessionExpired(); return; }
+        if (reportsBlocked || loginRequired || active.size >= workers) {
+          if (active.size) {
+            await Promise.race(active);
+            continue;
+          }
+        }
+        if (loginRequired) {
+          show('Steam 登录状态需要更新。请登录 Steam 后刷新本页，未完成项目已保存。');
+          return;
+        }
+        if (!active.size) {
+          reportsBlocked = false;
+          for (const report of Object.values(pendingReports())) {
+            if (report.job !== ACTIVE_JOB_ID) continue;
+            const delivered = await reportUnsubProgress(report.id, report.ok, report);
+            if (!delivered) reportsBlocked = true;
+          }
+          if (reportsBlocked) {
+            show('回报连接中断，结果已保存在浏览器，正在重试连接…');
+            await sleep(2000);
+            continue;
+          }
+        }
+        if (COMPLETED_PROGRESS) {
+          await Promise.all(active);
+          showFinished(COMPLETED_PROGRESS);
+          return;
+        }
+
+        const batch = await fetchBatchIdsPromise(workers - active.size);
+        if (batch.expired) { showUnsubSessionExpired(); return; }
+        if (batch.offline) {
+          show('正在等待程序恢复连接，未完成项目已保存在进度数据库…');
+          await sleep(2000);
+          continue;
+        }
+        const progress = batch.progress || {};
+        show(`成功 ${progress.ok || 0}/${progress.total || 0}，最终失败 ${progress.fail || 0}，运行中 ${active.size}，并发上限 ${workers}`);
+        const tasks = batch.tasks || [];
+        if (!tasks.length) {
+          if (batch.complete) {
+            await Promise.all(active);
+            showFinished(progress);
+            return;
+          }
+          show(`等待失败项重试或其他页面完成。成功 ${progress.ok || 0}/${progress.total || 0}…`);
+          await Promise.race([...active, sleep(batch.retry_after_ms || 1000)]);
+          continue;
+        }
+
+        for (const task of tasks) {
+          const running = processTask(task, batch.job)
+            .catch(error => {
+              reportsBlocked = true;
+              console.error('[持久化队列] 处理异常，未确认项目保留在程序进度中', task.id, error);
+            })
+            .finally(() => active.delete(running));
+          active.add(running);
+        }
+      }
+    } finally {
+      PROCESSING = false;
+    }
+  }
+
   // 单页面模式：批量处理工作项
   async function processSinglePageMode() {
+    if (DURABLE_BACKEND) return processDurableQueue();
     if (PROCESSING) return;
+    if (isUnsubSessionDead()){
+      showUnsubSessionExpired();
+      return;
+    }
     PROCESSING = true;
 
     console.log('[单页面模式] 开始批量处理...');
@@ -701,7 +1004,8 @@
 
     // 首先处理当前页面的 ID（这是第一个打开的页面）
     const currentId = getWorkshopId();
-    let idQueue = [];
+    let idQueue = SINGLE_PAGE_BOOT_IDS.slice();
+    SINGLE_PAGE_BOOT_IDS = [];
     let processedCount = 0;
     let failedCount = 0;
     // 极速模式只统计成功/失败
@@ -719,9 +1023,11 @@
           failedCount++;
           console.error('[单页面模式] ✗ 失败:', currentId, result.reason || '');
         }
+        try{ await reportUnsubProgress(currentId, !!(result && result.success)); }catch(_){}
         updateProgress('✓' + processedCount + ' | ✗' + failedCount);
         await new Promise(resolve => setTimeout(resolve, FAST_MODE ? 40 : 500));
       } catch(err) {
+        try{ await reportUnsubProgress(currentId, false); }catch(_){}
         failedCount++;
         console.error('[单页面模式] ✗ 异常:', currentId, err);
         updateProgress('✓' + processedCount + ' | ✗' + failedCount);
@@ -736,35 +1042,66 @@
 
     try {
       updateProgress('正在获取待处理列表...');
-      const batchUrl = buildBatchUrl(API_NEXT, BATCH_SIZE);
-      const batchPromise = new Promise((resolve, reject) => {
-        GM_xmlhttpRequest({
-          method: 'GET',
-          url: batchUrl,
-          onload: function(res) {
-            try {
-              const data = JSON.parse(res.responseText || '{}');
-              if (data.ids && Array.isArray(data.ids)) {
-                resolve(data.ids);
-              } else {
-                resolve([]);
-              }
-            } catch(e) {
-              resolve([]);
-            }
-          },
-          onerror: function() {
-            resolve([]);
-          }
-        });
-      });
-
-      idQueue = await batchPromise;
+      const bootBatch = await fetchBatchIdsPromise(BATCH_SIZE);
+      if (bootBatch.expired){
+        showUnsubSessionExpired();
+        PROCESSING = false;
+        return;
+      }
+      idQueue = bootBatch.ids;
       console.log('[单页面模式] 批量获取了', idQueue.length, '个项目');
       updateProgress('已获取 ' + idQueue.length + ' 个项目');
     } catch(e) {
       console.log('[单页面模式] 批量获取失败，将逐个获取');
       updateProgress('批量获取失败，将逐个处理');
+    }
+
+    const IS_SUBS_PAGE = /\/myworkshopfiles/i.test(location.pathname || '');
+
+    async function subsPageWebUiIdleWait(){
+      if (isUnsubSessionDead()){
+        showUnsubSessionExpired();
+        return;
+      }
+      PROCESSING = false;
+      updateProgress('等待 WebUI 投递新任务… (✓' + processedCount + ' | ✗' + failedCount + ')');
+      console.log('[单页面模式/WebUI] 队列为空，保持订阅页等待新任务（不关闭标签）');
+      let idleMs = 2500;
+      while (true){
+        if (isUnsubSessionDead()){
+          showUnsubSessionExpired();
+          return;
+        }
+        await new Promise(r=>setTimeout(r, idleMs));
+        const batch = await fetchBatchIdsPromise(BATCH_SIZE);
+        if (batch.expired){
+          showUnsubSessionExpired('等待任务时会话已失效，已停止轮询。请回到 WebUI 重新发起批量取消订阅。');
+          return;
+        }
+        const ids = batch.ids;
+        if (!ids.length){
+          idleMs = Math.min(15000, Math.round(idleMs * 1.4));
+          continue;
+        }
+        idleMs = 2500;
+        PROCESSING = true;
+        updateProgress('收到新任务: ' + ids.length + ' 项');
+        for (const wid of ids){
+          updateProgress('处理: ' + wid + ' (✓' + processedCount + ' | ✗' + failedCount + ')');
+          try{
+            const result = await unsubscribeByAPI(wid, DEFAULT_APPID, FAST_MODE ? 1 : 3);
+            if (result.success){ processedCount++; }
+            else { failedCount++; }
+            try{ await reportUnsubProgress(wid, !!(result && result.success)); }catch(_){}
+          }catch(err){
+            failedCount++;
+            console.error('[单页面模式/WebUI] ✗ 异常:', wid, err);
+          }
+          await new Promise(r=>setTimeout(r, FAST_MODE ? 40 : 500));
+        }
+        PROCESSING = false;
+        updateProgress('等待 WebUI 投递新任务… (✓' + processedCount + ' | ✗' + failedCount + ')');
+      }
     }
 
     // 处理队列中的每个 ID
@@ -777,30 +1114,13 @@
       } else {
         // 尝试重新批量获取
         try {
-          const batchUrl = buildBatchUrl(API_NEXT, BATCH_SIZE);
-          const batchPromise = new Promise((resolve, reject) => {
-            GM_xmlhttpRequest({
-              method: 'GET',
-              url: batchUrl,
-              onload: function(res) {
-                try {
-                  const data = JSON.parse(res.responseText || '{}');
-                  if (data.ids && Array.isArray(data.ids)) {
-                    resolve(data.ids);
-                  } else {
-                    resolve([]);
-                  }
-                } catch(e) {
-                  resolve([]);
-                }
-              },
-              onerror: function() {
-                resolve([]);
-              }
-            });
-          });
-
-          idQueue = await batchPromise;
+          const refill = await fetchBatchIdsPromise(BATCH_SIZE);
+          if (refill.expired){
+            showUnsubSessionExpired();
+            PROCESSING = false;
+            return;
+          }
+          idQueue = refill.ids;
           console.log('[单页面模式] 重新批量获取了', idQueue.length, '个项目');
 
           if (idQueue.length > 0) {
@@ -812,6 +1132,11 @@
       }
 
       if (!currentId) {
+        if (isWebUiSubsWaitBackend() && IS_SUBS_PAGE){
+          await subsPageWebUiIdleWait();
+          return;
+        }
+
         console.log('[单页面模式] =====================================');
         console.log('[单页面模式] 所有项目处理完毕！');
         console.log('[单页面模式] ✓ 成功:', processedCount);
@@ -822,12 +1147,16 @@
 
         // 更新进度显示为完成状态
         if (progressDiv) {
-          progressDiv.style.background = processedCount > 0 ? 'rgba(76, 175, 80, 0.95)' : 'rgba(244, 67, 54, 0.95)';
+          const isEmptyRun = (processedCount + failedCount) === 0;
+          progressDiv.style.background = isEmptyRun
+            ? 'rgba(244, 67, 54, 0.95)'
+            : (processedCount > 0 ? 'rgba(76, 175, 80, 0.95)' : 'rgba(244, 67, 54, 0.95)');
           progressDiv.innerHTML = '<div style="font-weight:bold;margin-bottom:8px;">' +
-            ('✓ 批量取消订阅完成') +
+            (isEmptyRun ? '⚠ 未获取到待处理任务' : '✓ 批量取消订阅完成') +
             '</div>' +
-            '<div>✓ 成功: ' + processedCount + ' 个</div>' +
-            '<div>✗ 失败: ' + failedCount + ' 个</div>' +
+            (isEmptyRun
+              ? '<div style="font-size:13px;line-height:1.5;">队列为空或无法连接 WebUI 服务器。<br>请确认 NAS 服务已重启、油猴 @connect 允许该地址。</div>'
+              : ('<div>✓ 成功: ' + processedCount + ' 个</div><div>✗ 失败: ' + failedCount + ' 个</div>')) +
             '<div style="margin-top:10px;font-size:12px;opacity:0.9;">5秒后自动关闭</div>';
           setTimeout(() => {
             try { progressDiv.remove(); } catch(e) {}
@@ -852,6 +1181,7 @@
           failedCount++;
           console.error('[单页面模式] ✗ 失败:', currentId, result.reason || '');
         }
+        try{ await reportUnsubProgress(currentId, !!(result && result.success)); }catch(_){}
         updateProgress('✓' + processedCount + ' | ✗' + failedCount);
         await new Promise(resolve => setTimeout(resolve, FAST_MODE ? 40 : 500));
         processNextId();
@@ -918,9 +1248,7 @@
   const IS_SUBS_PAGE = /\/myworkshopfiles/i.test(location.pathname || "");
 
   // 通过尝试访问 /batch 接口来判断是否是单页面模式
-  // 检测时不带 key 参数，避免消耗队列（只检测接口是否存在）
-  const baseUrl = API_NEXT.split('?')[0].replace('/next', '/batch');
-  const detectUrl = baseUrl + '?size=0';
+  const detectUrl = buildBatchUrl(API_NEXT, 0);
 
   console.log('[初始化] 检测 URL:', detectUrl);
 
@@ -930,11 +1258,15 @@
     timeout: 2000,
     onload: function(res) {
       try {
-        const data = JSON.parse(res.responseText || '{}');
-        if (data.ids && Array.isArray(data.ids)) {
-          // 服务器支持 /batch 接口，说明是单页面模式
+        const parsed = parseBatchResponse(res);
+        if (parsed.expired){
+          showUnsubSessionExpired();
+          return;
+        }
+        if (Array.isArray(parsed.ids)) {
+          if (parsed.ids.length) SINGLE_PAGE_BOOT_IDS = parsed.ids;
           SINGLE_PAGE_MODE = true;
-          console.log('[初始化] 检测到单页面模式支持');
+          console.log('[初始化] 检测到单页面模式支持', SINGLE_PAGE_BOOT_IDS.length ? `(boot ids: ${SINGLE_PAGE_BOOT_IDS.length})` : '');
           processSinglePageMode();
           return;
         }

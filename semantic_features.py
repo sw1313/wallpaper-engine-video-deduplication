@@ -174,9 +174,13 @@ class SemanticModel:
         if self.backend == "torch_hub":
             LOGGER.info("[semantic] 加载 DINOv2：%s  device=%s", name, device)
             torch.hub.set_dir(str(self.torch_hub_cache))
-            self.model = torch.hub.load(
-                spec["repo"], spec["entry"], verbose=False, trust_repo=True
-            )
+            local_repo = self.torch_hub_cache / "facebookresearch_dinov2_main"
+            if (local_repo / "hubconf.py").exists():
+                self.model = torch.hub.load(str(local_repo), spec["entry"], source="local", verbose=False)
+            else:
+                self.model = torch.hub.load(
+                    spec["repo"], spec["entry"], verbose=False, trust_repo=True
+                )
         elif self.backend == "hf_transformers":
             try:
                 from transformers import AutoModel

@@ -38,7 +38,7 @@ audio_merge_threshold = 0.15
 # —— 视觉语义（DINO）——
 semantic_feature_enabled = true
 semantic_feature_model = "dinov2_s"      # dinov2_s / dinov2_b / dinov2_l / dinov3_s / dinov3_b / dinov3_l
-semantic_feature_device = "cuda"         # auto / cuda / cpu
+semantic_feature_device = "auto"         # auto / cuda / cpu
 semantic_sample_frames = 60
 semantic_distance_threshold = 0.015
 semantic_max_threshold = 0.04

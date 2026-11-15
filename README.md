@@ -6,6 +6,30 @@ Wallpaper Engine 创意工坊视频筛重 + 批量取消订阅 + **已下架物�
 - **取消订阅**：根据筛重结果批量取消订阅重复项，保留文件最大的版本
 - **下架归档 / 按文件夹归档**：检测已下架/不可见物品 + 任意指定的 WE 文件夹，整批 `workshop → myprojects` 归档并同步 `config.json`，随后可一键批量取消订阅
 - **图形界面**：PySide6 (Qt 6) UI，参数可视化编辑，实时日志输出
+- **创意工坊归档识别**：可选补丁按创意工坊 ID 识别归档视频，在 WE 创意工坊页显示本地文件图标与「已订阅」，单击加载归档视频，双击应用并关闭窗口
+
+## 下载与升级
+
+### Windows 便携版
+
+下载 1.1.0 Release 中全部 `WEVideoTools-1.1.0-windows-x64.7z.*` 分卷，放在同一目录，用 7-Zip 打开 `.7z.001` 并解压。启动解压目录中的 `WEVideoTools.exe`。发布文件附有 SHA-256 校验表。[下载 Release](https://github.com/sw1313/wallpaper-engine-video-deduplication/releases/latest)
+
+便携版支持 Windows 10 / 11 x64，包含 Python 3.13、Qt 6、PyTorch、CUDA 13.0 运行库和 ffmpeg / ffprobe / fpcalc。推理设备默认 `auto`，根据硬件选择 CUDA 或 CPU。
+
+模型在首次使用语义特征时下载到 `models_cache/`，首次下载需要联网。使用基础 pHash、颜色直方图或音频指纹时，可关闭语义特征。
+
+首次启动请填写创意工坊目录与 WE 安装目录。Steam API Key 可在「下架归档」页填写。配置模板使用通用示例路径，输出目录 `output` 和模型缓存目录 `models_cache` 均相对于程序所在目录解析。
+
+升级时将新版解压到独立目录，再复制自己的 `config.toml`、`output/` 和 `models_cache/`。保留 `output/unsub_progress.sqlite3` 可继续之前的取消订阅任务，保留 `output/we_dedup_cache.sqlite3` 可复用已计算的签名。将 Tampermonkey 脚本更新到随包的 **20.2.0**。
+
+### 1.1.0 更新内容
+
+- 更新 Python 3.13 依赖与 Windows 打包方式，提供完整便携版。
+- 更新图形界面布局、参数搜索、提示与运行状态显示，修复中文日志和工作进程输出编码。
+- 输出目录与数据库使用程序目录下的相对路径，支持便携迁移。
+- 单页面取消订阅默认 8 路并发，可调 1–16 路，支持限流降速、持久化进度和失败重试。
+- 加强归档完整性校验、复制失败恢复和缓存一致性处理。
+- 增加可安装、重装和还原的 WE 创意工坊归档识别补丁。
 
 ## 环境准备
 
@@ -38,6 +62,21 @@ cp config.example.toml config.toml
 ## 使用方法
 
 ### 方式一：图形界面（推荐）
+
+Windows 打包版运行 `WEVideoTools.exe`。请保留整个目录，程序会使用同目录的 `config.toml`、`output/` 和 `models_cache/`。自行构建的程序位于 `dist/WEVideoTools/`。
+
+源码版可运行 `./start.ps1`，启动器固定使用项目的 `.venv` 环境。创建环境与安装依赖可使用以下命令。
+
+```powershell
+py -3.13 -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+# 使用 DINOv2 / DINOv3 时安装语义依赖
+.\.venv\Scripts\python.exe -m pip install -r requirements-semantic.txt
+```
+
+执行 `./build.ps1` 可重新打包，打包环境还需安装 `pyinstaller>=6.16`。通过 `./build.ps1 -ReleaseVersion 1.1.0` 可生成公开发布用的 7-Zip 分卷，需要 `7z` 命令位于 PATH 中。公开包从配置模板生成配置，包含运行程序与工具脚本。发布脚本会排除本机配置、输出数据和模型权重。
+
+界面通过侧栏切换三个功能，查重参数按组显示，支持中文名称与配置键搜索。鼠标悬停参数名称可查看详细说明。
 
 ```bash
 python we_ui.py
@@ -114,6 +153,12 @@ python we_delisted_archiver.py -c config.toml --list-archived-in-folder-index 2
 
 **取消订阅：**
 
+单页面模式默认在一个页面内并发处理 8 项，可在浏览器进度面板实时调节为 1–16 项。空闲位置会立即补入新任务，正常请求的启动间隔为 50 毫秒，遇到限流或网络异常时会降低请求频率。每项每轮最多尝试 3 次，失败后延迟重试。Steam 明确返回成功后才记录完成。
+
+退订进度保存到程序输出目录的 `unsub_progress.sqlite3`。停止、关闭浏览器或重启程序后，再次运行同一清单会跳过已确认成功的项目，继续处理失败和未确认项目。浏览器回报暂时中断时，油猴会暂存结果并重试提交。
+
+需要安装随包的 **20.2.0** 油猴脚本。命令行可通过 `--max-attempts` 设置每轮尝试次数，通过 `--state-db` 指定进度数据库。进度按清单中的物品 ID 集合区分，切换 Steam 账号后可用 `--restart` 重新处理该清单。
+
 1. 在默认浏览器中登录 Steam 账号
 2. 安装 Tampermonkey，导入 `wallpaper-engine-video-deduplication.js`
 3. 执行：
@@ -128,6 +173,29 @@ python bulk_unsub_controller.py --xlsx duplicates_xxx.xlsx --batch-size 1 --sing
 下架物品取消订阅时，UI 会生成 `delisted_unsub_*.xlsx`；按文件夹批量退订时生成 `archived_unsub_*.xlsx`。两者都会打开 `steamcommunity.com/my/myworkshopfiles?...#bulk_unsub=2`（与 `#bulk_unsub=1` 行为一致，便于区分用途）。
 
 > 如果网络不稳定导致取消订阅卡住，刷新浏览器标签页即可。
+
+### 可选功能——WE 创意工坊归档识别
+
+适用于归档到 `projects/myprojects/<创意工坊 ID>/` 或 `projects/backup/<创意工坊 ID>/` 的视频。补丁读取 WE 配置中的归档路径生成本地索引，并结合 WE 运行时提供的本地项目列表更新映射。
+
+在 WE 的「创意工坊」页，已验证可用的归档视频会显示本地文件图标，侧栏显示「已订阅」。单击直接加载归档视频，双击应用并调用 WE 原生关闭流程。补丁会过滤这些归档项的重复订阅请求。此标记表示本地归档可用，Steam 账号的实际订阅记录由 Steam 管理。
+
+在脚本所在目录打开 PowerShell，替换示例中的 WE 安装目录后运行。
+
+```powershell
+# 安装或更新补丁
+.\we_archive_bridge.ps1 -Action Install -InstallDir "E:\SteamLibrary\steamapps\common\wallpaper_engine"
+
+# 查看安装状态
+.\we_archive_bridge.ps1 -Action Status -InstallDir "E:\SteamLibrary\steamapps\common\wallpaper_engine"
+
+# 还原
+.\we_archive_bridge.ps1 -Action Uninstall -InstallDir "E:\SteamLibrary\steamapps\common\wallpaper_engine"
+```
+
+重新打开 WE 窗口后生效。安装脚本会备份界面入口文件，卸载时移除补丁入口。WE 更新覆盖界面文件后，可再次执行安装命令。新增归档可由 WE 运行时扫描识别，也可重装补丁以刷新启动索引。
+
+已验证的界面版本为 **Wallpaper Engine 2.8.797**。部分环境中，WE 原生「应用并关闭」会长时间卡顿，官方订阅项目也可复现。本版本沿用该原生关闭流程，这个问题仍待 WE 侧处理。
 
 ## 配置说明
 
@@ -277,8 +345,8 @@ steam_api_key = ""   # 推荐填写：https://steamcommunity.com/dev/apikey
 **语义特征安装**：
 
 ```bash
-# GPU（CUDA 12.x，根据显卡驱动选 index-url）
-pip install torch --index-url https://download.pytorch.org/whl/cu121
+# 安装语义特征依赖，GPU 版可按 PyTorch 官方安装说明选择对应 CUDA wheel
+pip install -r requirements-semantic.txt
 # CPU 版本
 pip install torch --index-url https://download.pytorch.org/whl/cpu
 ```
@@ -315,10 +383,18 @@ DINO 的 per-frame 全局距离只能告诉你"两段视频差多少"，但分�
 ├── semantic_features.py              # DINOv2/v3 加载与 patch 级空间裁决
 ├── config.example.toml               # 配置模板（真实 config.toml 本地自建，已 .gitignore）
 ├── requirements.txt                  # Python 依赖
-├── 取消收藏已下架的创意工坊物品-0.1.user.js   # 参考用：浏览器内检测下架并取消订阅
+├── requirements-semantic.txt         # 语义特征依赖
+├── launcher.py                       # 打包入口与工作进程调度
+├── start.ps1                         # 使用本项目 Python 环境启动
+├── build.ps1                         # Windows 程序构建
+├── package_release.py                # 公开 Release 打包，排除本地数据与模型
+├── we_archive_bridge.ps1             # WE 创意工坊归档补丁管理
+├── we_archive_bridge.js              # 归档状态映射与加载路径处理
+├── tests/                           # 回归测试
 ├── output/
 │   ├── bulk_unsub_controller.py      # 取消订阅协调（本地 HTTP + 打开浏览器）
 │   ├── we_dedup_cache.sqlite3        # 签名缓存数据库
+│   ├── unsub_progress.sqlite3        # 取消订阅进度与重试状态
 │   ├── duplicates_*.xlsx             # 筛重结果（创意工坊链接版，取消订阅流程使用）
 │   ├── duplicate_paths_*.xlsx        # 筛重结果（所在文件夹路径版，人工处理用）
 │   ├── delisted_items.json           # 下架检测结果（由 we_delisted_archiver 生成）
@@ -330,4 +406,11 @@ DINO 的 per-frame 全局距离只能告诉你"两段视频差多少"，但分�
 ## 相关脚本说明
 
 - **`wallpaper-engine-video-deduplication.js`**：URL 含 `#bulk_unsub=1` 或 `#bulk_unsub=2` 时与 `bulk_unsub_controller.py` 配合，在浏览器内调用 Steam 取消订阅接口（使用当前登录 Cookie）。
-- **`取消收藏已下架的创意工坊物品-0.1.user.js`**：在订阅列表分页爬取并访问详情页判断下架；本仓库的 Python 检测以 API 为主，可与油猴流程互补。
+- **`we_archive_bridge.ps1` / `we_archive_bridge.js`**：管理 WE 创意工坊页中的本地归档识别功能，生成的归档索引与界面备份保存在各自的 WE 安装目录。
+
+## 开发验证
+
+```powershell
+.\.venv\Scripts\python.exe -m unittest discover -s tests -p "test_*.py"
+node --test tests/*.cjs
+```

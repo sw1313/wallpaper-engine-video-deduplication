@@ -19,8 +19,10 @@ import logging
 import os
 import shutil
 import stat
+import subprocess
 import sys
 import time
+import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -37,6 +39,7 @@ STEAM_API_OLD = "https://api.steampowered.com/ISteamRemoteStorage/GetPublishedFi
 STEAM_API_NEW = "https://api.steampowered.com/IPublishedFileService/GetDetails/v1/"
 BATCH_SIZE = 80
 REQUEST_TIMEOUT = 30
+ARCHIVE_COPY_BACKENDS = ("auto", "python", "robocopy")
 
 # ---------------------------------------------------------------------------
 # Config
@@ -174,8 +177,7 @@ def batch_check_delisted(
             details = _fetch_batch_old_api(chunk)
 
         if details is None:
-            log.warning("[DETECT] 批次 %d/%d 请求失败，跳过", batch_idx + 1, batches)
-            continue
+            raise RuntimeError(f"Steam API 批次 {batch_idx + 1}/{batches} 请求失败，请重试检测")
 
         returned_ids = set()
         for item in details:
@@ -214,7 +216,6 @@ def run_detect(
 
     if not all_ids:
         log.warning("[DETECT] 没有找到任何订阅项目")
-        return []
 
     log.info("[DETECT] 开始通过 Steam API 检测下架状态...")
     delisted = batch_check_delisted(all_ids, api_key=api_key)
@@ -346,10 +347,139 @@ def _write_config_atomic(cfg_path: Path, cfg: dict) -> None:
     log.info("[ARCHIVE] config.json 已更新")
 
 
+def _normalize_copy_backend(value: Any) -> str:
+    backend = str(value or "auto").strip().lower()
+    if backend not in ARCHIVE_COPY_BACKENDS:
+        log.warning("[ARCHIVE] 未知 archive_copy_backend=%r，回退 auto", value)
+        return "auto"
+    return backend
+
+
+def _copytree_python(src_dir: Path, dst_dir: Path) -> None:
+    shutil.copytree(str(src_dir), str(dst_dir), dirs_exist_ok=True)
+
+
+def _file_sizes(directory: Path) -> Dict[str, int]:
+    sizes: Dict[str, int] = {}
+    pending = [(directory, Path())]
+    while pending:
+        parent, relative = pending.pop()
+        with os.scandir(parent) as entries:
+            for entry in entries:
+                name = relative / entry.name
+                if entry.is_dir(follow_symlinks=False):
+                    pending.append((Path(entry.path), name))
+                elif entry.is_file():
+                    sizes[str(name)] = entry.stat().st_size
+    return sizes
+
+
+def _archive_complete(src_dir: Optional[Path], dst_dir: Path) -> bool:
+    """Validate the archived project and source file sizes before offering unsubscribe."""
+    try:
+        with (dst_dir / "project.json").open("r", encoding="utf-8-sig") as stream:
+            project = json.load(stream)
+        media = str(project.get("file", ""))
+        if not media:
+            return False
+        target = (dst_dir / media).resolve()
+        if not target.is_relative_to(dst_dir.resolve()) or not target.is_file():
+            return False
+        if src_dir is not None and src_dir.is_dir():
+            source_sizes = _file_sizes(src_dir)
+            archived_sizes = _file_sizes(dst_dir)
+            if any(archived_sizes.get(name) != size for name, size in source_sizes.items()):
+                return False
+        return True
+    except (OSError, ValueError, TypeError, AttributeError):
+        return False
+
+
+def _copytree_robocopy(src_dir: Path, dst_dir: Path) -> Tuple[bool, str]:
+    robocopy = shutil.which("robocopy")
+    if not robocopy:
+        return False, "robocopy 不可用"
+
+    cmd = [
+        robocopy,
+        str(src_dir),
+        str(dst_dir),
+        "/E",
+        "/COPY:DAT",
+        "/DCOPY:DAT",
+        "/R:2",
+        "/W:1",
+        "/NP",
+        "/NFL",
+        "/NDL",
+    ]
+    r = subprocess.run(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0,
+    )
+    if 0 <= r.returncode <= 7:
+        return True, f"robocopy rc={r.returncode}"
+    out = (r.stdout or "").strip()
+    detail = f"robocopy rc={r.returncode}"
+    if out:
+        detail += f": {out[-1000:]}"
+    return False, detail
+
+
+def _copytree_archive_payload(src_dir: Path, dst_dir: Path, copy_backend: str) -> None:
+    """复制归档目录。
+
+    `robocopy` 走 Windows 原生复制路径，SMB 服务端支持时可能触发服务端复制；
+    不支持时仍会退化为普通客户端复制。`auto` 下 robocopy 失败会回退 Python。
+    """
+    backend = _normalize_copy_backend(copy_backend)
+    if backend == "python" or os.name != "nt":
+        if backend == "robocopy" and os.name != "nt":
+            log.warning("[ARCHIVE] robocopy 仅支持 Windows，改用 Python 复制")
+        _copytree_python(src_dir, dst_dir)
+        return
+
+    ok, detail = _copytree_robocopy(src_dir, dst_dir)
+    if ok:
+        log.info(
+            "[ARCHIVE] 已使用 robocopy 复制（%s）；是否服务端内部复制取决于 SMB 服务器支持",
+            detail,
+        )
+        return
+    if backend == "robocopy":
+        raise RuntimeError(detail)
+    log.warning("[ARCHIVE] robocopy 复制失败，回退 Python 复制：%s", detail)
+    _copytree_python(src_dir, dst_dir)
+
+
+def _copytree_for_archive(src_dir: Path, dst_dir: Path, copy_backend: str) -> None:
+    if dst_dir.exists():
+        # Repair incomplete archives left by older releases. Extra local files are retained.
+        _copytree_archive_payload(src_dir, dst_dir, copy_backend)
+        if not _archive_complete(src_dir, dst_dir):
+            raise RuntimeError(f"归档校验失败：{dst_dir}")
+        return
+    staging = dst_dir.with_name(f".{dst_dir.name}.{uuid.uuid4().hex}.partial")
+    try:
+        _copytree_archive_payload(src_dir, staging, copy_backend)
+        if not _archive_complete(src_dir, staging):
+            raise RuntimeError(f"归档校验失败：{src_dir}")
+        staging.rename(dst_dir)
+    finally:
+        if staging.exists():
+            shutil.rmtree(staging)
+
+
 def run_archive(
     workshop_root: Path,
     we_install_dir: Path,
     delisted_path: Path,
+    copy_backend: str = "auto",
 ) -> None:
     if not delisted_path.exists():
         log.error("[ARCHIVE] 找不到下架记录文件: %s", delisted_path)
@@ -395,13 +525,14 @@ def run_archive(
         dst_dir = myprojects_dir / wid
 
         # --- 复制文件夹 ---
-        if not src_dir.is_dir():
+        if _archive_complete(src_dir, dst_dir):
+            log.info("[ARCHIVE] %s: 已有完整归档，跳过复制", wid)
+        elif not src_dir.is_dir():
             log.warning("[ARCHIVE] %s: workshop 源文件夹不存在，跳过复制", wid)
-        elif dst_dir.exists():
-            log.info("[ARCHIVE] %s: myprojects 目标已存在，跳过复制", wid)
+            continue
         else:
             try:
-                shutil.copytree(str(src_dir), str(dst_dir))
+                _copytree_for_archive(src_dir, dst_dir, copy_backend)
                 copied += 1
                 log.info("[ARCHIVE] %s: 已复制到 %s", wid, dst_dir)
             except Exception as e:
@@ -454,6 +585,8 @@ def run_archive(
         "[ARCHIVE] 完成: 复制 %d 个文件夹, 更新 %d 条 config 条目",
         copied, config_updated,
     )
+    if any(not _archive_complete(workshop_root / item["id"], myprojects_dir / item["id"]) for item in items):
+        raise RuntimeError("部分物品归档失败，可修复后重新执行归档")
 
 
 # ---------------------------------------------------------------------------
@@ -531,8 +664,34 @@ def _load_we_config(we_install_dir: Path) -> Tuple[Optional[dict], Optional[Path
         return None, None
 
 
-def cmd_list_folders(we_install_dir: Path) -> None:
-    """列出 config.json 中全部文件夹 + 各自 workshop / myprojects 条目数，输出 JSON 到 stdout。"""
+def _snapshot_workshop_wids(workshop_root: Path) -> Optional[set]:
+    """一次性扫 workshop_root 下的 wid 目录名到 set，供 O(1) 查询。
+
+    对一万多条 workshop 逐个 `Path.is_dir()` 在机械盘 / 网络盘上会慢到
+    15s timeout 都扛不住，换成 `os.scandir` 扫一次全量名字，后续 `wid in
+    snap` 常数复杂度。
+    """
+    try:
+        snap: set = set()
+        with os.scandir(str(workshop_root)) as it:
+            for entry in it:
+                # wid 目录名都是纯数字；名字对得上就视为"目录存在"
+                # （极端情况里有同名文件，会被误判为在盘，概率极小不处理）
+                if entry.name.isdigit():
+                    snap.add(entry.name)
+        return snap
+    except OSError as e:
+        log.warning("[FOLDER] 扫 workshop_root 失败: %s", e)
+        return None
+
+
+def cmd_list_folders(we_install_dir: Path, workshop_root: Optional[Path] = None) -> None:
+    """列出 config.json 中全部文件夹 + 各自 workshop / myprojects 条目数，输出 JSON 到 stdout。
+
+    给了 workshop_root 时，额外统计 `workshop_alive_count`：
+    即 config.json items 里记录的 workshop wid 中，`<workshop_root>/<wid>/`
+    目录仍真实存在（= Steam 还在订阅中）的个数。
+    """
     we_cfg, _cfg_path = _load_we_config(we_install_dir)
     if we_cfg is None:
         print(json.dumps({"folders": [], "error": "config_json_missing"}, ensure_ascii=False))
@@ -541,18 +700,28 @@ def cmd_list_folders(we_install_dir: Path) -> None:
     if container is None or key is None:
         print(json.dumps({"folders": [], "error": "no_folders_slot"}, ensure_ascii=False))
         return
+    wr_valid = workshop_root is not None and workshop_root.is_dir()
+    alive_snap: Optional[set] = None
+    if wr_valid:
+        assert workshop_root is not None
+        alive_snap = _snapshot_workshop_wids(workshop_root)
     flat = _flatten_folders(container[key])
     folders_out: List[Dict[str, Any]] = []
     for idx, (display, fdict) in enumerate(flat):
         items = fdict.get("items", {}) or {}
         ws = _collect_workshop_in_items(items)
         mp = _collect_myprojects_in_items(items)
-        folders_out.append({
+        entry: Dict[str, Any] = {
             "index": idx,
             "title": display,
             "workshop_count": len(ws),
             "myprojects_count": len(mp),
-        })
+        }
+        if alive_snap is not None:
+            alive = sum(1 for wid in ws if wid in alive_snap)
+            entry["workshop_alive_count"] = alive
+            entry["workshop_orphan_count"] = len(ws) - alive
+        folders_out.append(entry)
     print(json.dumps({"folders": folders_out}, ensure_ascii=False))
 
 
@@ -562,6 +731,7 @@ def _archive_one_wid(
     myprojects_dir: Path,
     install_dir_unc: str,
     folder_items: Dict[str, Any],
+    copy_backend: str = "auto",
 ) -> Tuple[bool, bool]:
     """把单个 workshop wid 归档到 myprojects，并把路径加进目标 folder.items。
 
@@ -571,18 +741,19 @@ def _archive_one_wid(
     dst_dir = myprojects_dir / wid
 
     copied = False
-    if not src_dir.is_dir():
+    if _archive_complete(src_dir, dst_dir):
+        log.info("[FOLDER-ARC] %s: 已有完整归档，跳过复制", wid)
+    elif not src_dir.is_dir():
         log.warning("[FOLDER-ARC] %s: workshop 源目录不存在，跳过", wid)
-    elif dst_dir.exists():
-        log.info("[FOLDER-ARC] %s: myprojects 已存在，跳过复制", wid)
+        return (False, False)
     else:
         try:
-            shutil.copytree(str(src_dir), str(dst_dir))
+            _copytree_for_archive(src_dir, dst_dir, copy_backend)
             copied = True
             log.info("[FOLDER-ARC] %s: 已复制到 %s", wid, dst_dir)
         except Exception as e:
             log.error("[FOLDER-ARC] %s: 复制失败: %s", wid, e)
-            return (False, False)
+            raise RuntimeError(f"{wid}: 复制失败：{e}") from e
 
     # 读 project.json 拿 file 字段（用 dst > src 顺序，兜底用 src）
     proj_json = dst_dir / "project.json"
@@ -590,18 +761,18 @@ def _archive_one_wid(
         proj_json = src_dir / "project.json"
     if not proj_json.exists():
         log.warning("[FOLDER-ARC] %s: 找不到 project.json，跳过 config 更新", wid)
-        return (copied, False)
+        raise RuntimeError(f"{wid}: 找不到 project.json")
     try:
         with proj_json.open("r", encoding="utf-8") as f:
             proj = json.load(f)
     except Exception as e:
         log.warning("[FOLDER-ARC] %s: 读取 project.json 失败: %s", wid, e)
-        return (copied, False)
+        raise RuntimeError(f"{wid}: 读取 project.json 失败：{e}") from e
 
     video_file = proj.get("file", "")
     if not video_file:
         log.warning("[FOLDER-ARC] %s: project.json 缺 file 字段", wid)
-        return (copied, False)
+        raise RuntimeError(f"{wid}: project.json 缺 file 字段")
 
     rel_path = f"projects/myprojects/{wid}/{video_file}"
     we_path_entry = _win_path_to_unc_forward(rel_path, install_dir_unc)
@@ -619,6 +790,7 @@ def run_archive_folder(
     workshop_root: Path,
     we_install_dir: Path,
     folder_index: int,
+    copy_backend: str = "auto",
 ) -> None:
     """把 config.json 中指定 folder 内所有 workshop 项归档到 myprojects（不动已归档的）。"""
     we_cfg, cfg_path = _load_we_config(we_install_dir)
@@ -649,6 +821,11 @@ def run_archive_folder(
 
     workshop_wids = _collect_workshop_in_items(items)
     existing_mp = set(_collect_myprojects_in_items(items))
+    alive_wids = _snapshot_workshop_wids(workshop_root)
+    if alive_wids is None:
+        raise RuntimeError("无法读取创意工坊目录，请检查网络或磁盘连接")
+    active_wids = [wid for wid in workshop_wids if wid in alive_wids]
+    skipped_missing = len(workshop_wids) - len(active_wids)
 
     log.info(
         "[FOLDER-ARC] 目标 folder: '%s'（workshop=%d, 已归档=%d）",
@@ -658,13 +835,19 @@ def run_archive_folder(
     copied = 0
     config_added = 0
     skipped_already = 0
-    for wid in workshop_wids:
-        if wid in existing_mp:
+    failed_wids: List[str] = []
+    for wid in active_wids:
+        if wid in existing_mp and _archive_complete(workshop_root / wid, myprojects_dir / wid):
             skipped_already += 1
             continue
-        c, a = _archive_one_wid(
-            wid, workshop_root, myprojects_dir, install_dir_unc, items,
-        )
+        try:
+            c, a = _archive_one_wid(
+                wid, workshop_root, myprojects_dir, install_dir_unc, items, copy_backend,
+            )
+        except Exception as exc:
+            failed_wids.append(wid)
+            log.error("[FOLDER-ARC] %s: %s", wid, exc)
+            continue
         if c:
             copied += 1
         if a:
@@ -674,14 +857,17 @@ def run_archive_folder(
         _write_config_atomic(cfg_path, we_cfg)
 
     log.info(
-        "[FOLDER-ARC] 完成 '%s': 复制 %d 个目录, 新增 %d 条 config 条目, 已归档跳过 %d",
-        display, copied, config_added, skipped_already,
+        "[FOLDER-ARC] 完成 '%s': 复制 %d 个目录, 新增 %d 条 config 条目, 已归档跳过 %d, 源已不存在跳过 %d, 失败 %d",
+        display, copied, config_added, skipped_already, skipped_missing, len(failed_wids),
     )
+    if failed_wids:
+        raise RuntimeError(f"{len(failed_wids)} 个物品归档失败，wid：{', '.join(failed_wids[:20])}")
 
 
 def cmd_list_archived_in_folder(
     we_install_dir: Path,
     folder_index: int,
+    workshop_root: Optional[Path] = None,
 ) -> None:
     """列出指定 folder 中 "workshop 存在 且 myprojects 已归档" 的 wid（用于取消订阅手动归档）。
 
@@ -690,6 +876,10 @@ def cmd_list_archived_in_folder(
          projects/myprojects/<wid>/... 两条路径（最常见）
       2) 或即便 folder.items 里没有 myprojects 条目，但 myprojects/<wid>/ 目录
          实际存在（用户自己搬过文件的情况）
+
+    给了 workshop_root 时，会额外过滤：只保留 `<workshop_root>/<wid>/` 仍然存在
+    的 wid——Steam 端已退订的 wid 本地 workshop 目录早就没了，再塞给
+    bulk_unsub_controller 也是空跑（Steam 网页端直接 404），没必要。
     """
     we_cfg, _cfg_path = _load_we_config(we_install_dir)
     if we_cfg is None:
@@ -707,23 +897,196 @@ def cmd_list_archived_in_folder(
     items = target.get("items", {}) or {}
 
     workshop_wids = _collect_workshop_in_items(items)
-    mp_subnames = set(_collect_myprojects_in_items(items))
     myprojects_dir = we_install_dir / "projects" / "myprojects"
 
+    # 同理：一次性扫 myprojects / workshop 下的子目录名到 set，避免逐个 stat。
+    mp_disk_snap: set = set()
+    try:
+        with os.scandir(str(myprojects_dir)) as it:
+            for entry in it:
+                mp_disk_snap.add(entry.name)
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        raise RuntimeError(f"无法读取本地归档目录：{exc}") from exc
+
+    ws_alive_snap: Optional[set] = None
+    if workshop_root is not None:
+        ws_alive_snap = _snapshot_workshop_wids(workshop_root)
+        if ws_alive_snap is None:
+            raise RuntimeError("无法读取创意工坊目录，请检查网络或磁盘连接")
+
     archived: List[str] = []
+    skipped_already_unsubbed = 0
+    orphan_wids: List[str] = []
+    incomplete_wids: List[str] = []
+    candidates: List[str] = []
     for wid in workshop_wids:
-        if wid in mp_subnames:
-            archived.append(wid); continue
-        if (myprojects_dir / wid).is_dir():
-            archived.append(wid); continue
+        alive_on_disk = (ws_alive_snap is None) or (wid in ws_alive_snap)
+        if not alive_on_disk:
+            # 磁盘上 workshop 目录已经没了（= 老版本就已经退订过）。不管有没有
+            # 归档，都是 config.json 里的幽灵条目，需要清理。
+            orphan_wids.append(wid)
+            if wid in mp_disk_snap:
+                skipped_already_unsubbed += 1
+            continue
+        if wid in mp_disk_snap:
+            candidates.append(wid)
+
+    log.info("[VERIFY] 文件夹 '%s': 开始校验 %d 个本地归档项目", display, len(candidates))
+    for index, wid in enumerate(candidates, start=1):
+        if _archive_complete(workshop_root / wid if workshop_root is not None else None, myprojects_dir / wid):
+            archived.append(wid)
+        else:
+            incomplete_wids.append(wid)
+        if index % 25 == 0 or index == len(candidates):
+            log.info("[VERIFY] 已校验 %d/%d，完整 %d，不完整 %d", index, len(candidates), len(archived), len(incomplete_wids))
 
     out = {
         "folder": display,
         "index": folder_index,
         "workshop_total": len(workshop_wids),
         "archived_wids": archived,
+        "skipped_already_unsubbed": skipped_already_unsubbed,
+        "orphan_wids": orphan_wids,
+        "incomplete_wids": incomplete_wids,
     }
     print(json.dumps(out, ensure_ascii=False))
+
+
+# ---------------------------------------------------------------------------
+# Cleanup orphan workshop entries in config.json
+# ---------------------------------------------------------------------------
+
+def run_remove_workshop_wids_from_config(
+    we_install_dir: Path,
+    wids: List[str],
+) -> None:
+    """把 config.json 所有 folders.items 里匹配给定 wid 集的 workshop 条目删掉。
+
+    场景：刚用 bulk_unsub_controller 把这批 wid 在 Steam 端退订完，Steam
+    客户端删本地 workshop 目录有延迟，不能只靠"磁盘目录是否存在"来判断
+    幽灵；这里直接按明确的 wid 列表动手，时序安全。
+
+    匹配两种 key：纯数字（"3527146660"）+ 含 workshop 路径的 UNC
+    字符串。
+    """
+    if not wids:
+        log.info("[REMOVE-WIDS] wid 列表为空，跳过。")
+        return
+    we_cfg, cfg_path = _load_we_config(we_install_dir)
+    if we_cfg is None or cfg_path is None:
+        return
+    container, key = _locate_folders_slot(we_cfg)
+    if container is None or key is None:
+        log.error("[REMOVE-WIDS] config.json 找不到 folders 结构")
+        return
+    target_set = {str(w).strip() for w in wids if str(w).strip()}
+    flat = _flatten_folders(container[key])
+
+    total_removed = 0
+    affected_folders = 0
+    for display, fdict in flat:
+        items = fdict.get("items", {})
+        if not isinstance(items, dict):
+            continue
+        dead_keys: List[str] = []
+        for raw_key in list(items.keys()):
+            s = str(raw_key)
+            wid: Optional[str] = None
+            if s.isdigit():
+                wid = s
+            else:
+                m = _WORKSHOP_PATH_RE.search(_path_normalize(s))
+                if m:
+                    wid = m.group(1)
+            if wid is not None and wid in target_set:
+                dead_keys.append(raw_key)
+        if dead_keys:
+            affected_folders += 1
+            for k in dead_keys:
+                items.pop(k, None)
+            total_removed += len(dead_keys)
+            log.info(
+                "[REMOVE-WIDS] '%s': 移除 %d 条已退订 workshop 记录",
+                display, len(dead_keys),
+            )
+
+    if total_removed > 0:
+        _write_config_atomic(cfg_path, we_cfg)
+        log.info(
+            "[REMOVE-WIDS] 完成: 共清理 %d 条 workshop 记录，涉及 %d 个文件夹",
+            total_removed, affected_folders,
+        )
+    else:
+        log.info("[REMOVE-WIDS] config.json 里没有需要清理的 workshop 记录。")
+
+
+def run_cleanup_orphan_workshop(
+    workshop_root: Path,
+    we_install_dir: Path,
+) -> None:
+    """扫描 config.json 所有 folders.items，把"workshop 条目但对应 wid 在
+    `<workshop_root>/<wid>/` 不存在"的死键删掉。
+
+    为什么需要：用户在 Steam 取消订阅后，workshop 目录会被 Steam 删掉，但
+    WE 自己不会清 config.json 里的分类记录，导致该文件夹下
+    `workshop_count` 永远不掉。"""
+    if not workshop_root.is_dir():
+        log.error("[CLEANUP] workshop_root 无效: %s", workshop_root)
+        return
+    we_cfg, cfg_path = _load_we_config(we_install_dir)
+    if we_cfg is None or cfg_path is None:
+        return
+    container, key = _locate_folders_slot(we_cfg)
+    if container is None or key is None:
+        log.error("[CLEANUP] config.json 找不到 folders 结构")
+        return
+    flat = _flatten_folders(container[key])
+
+    alive_snap = _snapshot_workshop_wids(workshop_root)
+    if alive_snap is None:
+        log.error("[CLEANUP] 无法枚举 workshop_root，放弃清理")
+        return
+
+    total_removed = 0
+    affected_folders = 0
+    for display, fdict in flat:
+        items = fdict.get("items", {})
+        if not isinstance(items, dict):
+            continue
+        dead_keys: List[str] = []
+        for raw_key in list(items.keys()):
+            s = str(raw_key)
+            wid: Optional[str] = None
+            if s.isdigit():
+                wid = s
+            else:
+                m = _WORKSHOP_PATH_RE.search(_path_normalize(s))
+                if m:
+                    wid = m.group(1)
+            if wid is None:
+                continue
+            if wid not in alive_snap:
+                dead_keys.append(raw_key)
+        if dead_keys:
+            affected_folders += 1
+            for k in dead_keys:
+                items.pop(k, None)
+            total_removed += len(dead_keys)
+            log.info(
+                "[CLEANUP] '%s': 移除 %d 个幽灵 workshop 条目",
+                display, len(dead_keys),
+            )
+
+    if total_removed > 0:
+        _write_config_atomic(cfg_path, we_cfg)
+        log.info(
+            "[CLEANUP] 完成: 共清理 %d 个幽灵 workshop 条目，涉及 %d 个文件夹",
+            total_removed, affected_folders,
+        )
+    else:
+        log.info("[CLEANUP] 没有发现幽灵 workshop 条目")
 
 
 # ---------------------------------------------------------------------------
@@ -806,11 +1169,22 @@ def main():
                     help="把指定索引的文件夹（来自 --list-folders）内全部 workshop 项归档到 myprojects")
     ap.add_argument("--list-archived-in-folder-index", type=int, default=None,
                     help="列出指定文件夹里已归档的 wid（JSON 到 stdout，供 UI 生成退订 xlsx）")
+    ap.add_argument("--cleanup-orphan-workshop-items", action="store_true",
+                    help="扫描 config.json，删除磁盘上 workshop 目录已不存在的幽灵分类条目")
+    ap.add_argument("--remove-workshop-wids-from-config", action="store_true",
+                    help="按显式 wid 列表从 config.json 里删除 workshop 分类条目（配 --wids-file 使用）")
+    ap.add_argument("--wids-file", default=None,
+                    help="JSON 文件路径：顶层是 wid 数组，或对象 {\"archived_wids\":[...]}")
 
     ap.add_argument("--workshop-root", help="覆盖 workshop_root")
     ap.add_argument("--we-install-dir", help="覆盖 we_install_dir")
     ap.add_argument("--steam-api-key", help="覆盖 steam_api_key")
     ap.add_argument("--output", help="覆盖 delisted_items.json 路径")
+    ap.add_argument(
+        "--copy-backend",
+        choices=ARCHIVE_COPY_BACKENDS,
+        help="归档复制后端：auto/python/robocopy（默认读 archive_copy_backend，缺省 auto）",
+    )
     args = ap.parse_args()
 
     cfg = load_config(Path(args.config))
@@ -818,6 +1192,7 @@ def main():
     workshop_root = Path(args.workshop_root or cfg.get("workshop_root", ""))
     we_install_dir = Path(args.we_install_dir or cfg.get("we_install_dir", ""))
     api_key = args.steam_api_key or str(cfg.get("steam_api_key", "")).strip()
+    copy_backend = _normalize_copy_backend(args.copy_backend or cfg.get("archive_copy_backend", "auto"))
     output_dir = Path(cfg.get("output_dir", "output"))
     delisted_path = Path(args.output) if args.output else (output_dir / "delisted_items.json")
 
@@ -830,6 +1205,8 @@ def main():
         or args.list_folders
         or args.archive_folder_index is not None
         or args.list_archived_in_folder_index is not None
+        or args.cleanup_orphan_workshop_items
+        or args.remove_workshop_wids_from_config
     )
     if not any_action:
         ap.print_help()
@@ -841,7 +1218,8 @@ def main():
             log.error("we_install_dir 无效: %s", we_install_dir)
             print(json.dumps({"folders": [], "error": "we_install_dir_invalid"}, ensure_ascii=False))
             sys.exit(1)
-        cmd_list_folders(we_install_dir)
+        wr = workshop_root if workshop_root and workshop_root.is_dir() else None
+        cmd_list_folders(we_install_dir, workshop_root=wr)
         return
 
     if args.list_archived_in_folder_index is not None:
@@ -849,7 +1227,8 @@ def main():
             log.error("we_install_dir 无效: %s", we_install_dir)
             print(json.dumps({"wids": [], "error": "we_install_dir_invalid"}, ensure_ascii=False))
             sys.exit(1)
-        cmd_list_archived_in_folder(we_install_dir, args.list_archived_in_folder_index)
+        wr = workshop_root if workshop_root and workshop_root.is_dir() else None
+        cmd_list_archived_in_folder(we_install_dir, args.list_archived_in_folder_index, workshop_root=wr)
         return
 
     if args.detect:
@@ -862,7 +1241,7 @@ def main():
         if not we_install_dir or not we_install_dir.is_dir():
             log.error("we_install_dir 无效: %s", we_install_dir)
             sys.exit(1)
-        run_archive(workshop_root, we_install_dir, delisted_path)
+        run_archive(workshop_root, we_install_dir, delisted_path, copy_backend=copy_backend)
 
     if args.archive_folder_index is not None:
         if not workshop_root or not workshop_root.is_dir():
@@ -871,7 +1250,47 @@ def main():
         if not we_install_dir or not we_install_dir.is_dir():
             log.error("we_install_dir 无效: %s", we_install_dir)
             sys.exit(1)
-        run_archive_folder(workshop_root, we_install_dir, args.archive_folder_index)
+        run_archive_folder(
+            workshop_root,
+            we_install_dir,
+            args.archive_folder_index,
+            copy_backend=copy_backend,
+        )
+
+    if args.cleanup_orphan_workshop_items:
+        if not workshop_root or not workshop_root.is_dir():
+            log.error("workshop_root 无效: %s", workshop_root)
+            sys.exit(1)
+        if not we_install_dir or not we_install_dir.is_dir():
+            log.error("we_install_dir 无效: %s", we_install_dir)
+            sys.exit(1)
+        run_cleanup_orphan_workshop(workshop_root, we_install_dir)
+
+    if args.remove_workshop_wids_from_config:
+        if not we_install_dir or not we_install_dir.is_dir():
+            log.error("we_install_dir 无效: %s", we_install_dir)
+            sys.exit(1)
+        if not args.wids_file:
+            log.error("--remove-workshop-wids-from-config 需要 --wids-file")
+            sys.exit(1)
+        wids_path = Path(args.wids_file)
+        if not wids_path.exists():
+            log.error("--wids-file 不存在: %s", wids_path)
+            sys.exit(1)
+        try:
+            with wids_path.open("r", encoding="utf-8") as f:
+                raw = json.load(f)
+        except Exception as e:
+            log.error("解析 --wids-file 失败: %s", e)
+            sys.exit(1)
+        if isinstance(raw, dict):
+            wids_list = raw.get("archived_wids") or raw.get("wids") or []
+        elif isinstance(raw, list):
+            wids_list = raw
+        else:
+            log.error("--wids-file 顶层必须是数组或 {archived_wids/wids: [...]}")
+            sys.exit(1)
+        run_remove_workshop_wids_from_config(we_install_dir, [str(x) for x in wids_list])
 
     if args.gen_xlsx:
         xlsx_path = output_dir / f"delisted_unsub_{time.strftime('%Y%m%d_%H%M%S')}.xlsx"

@@ -6,6 +6,8 @@ __pycache__/
 .venv/
 venv/
 env/
+build/
+dist/
 
 # Editors / OS
 .idea/
@@ -16,6 +18,9 @@ Thumbs.db
 # 本地私有配置（含个人路径 / Steam API Key）
 # 仓库只提交 config.example.toml，复制一份为 config.toml 本地使用
 config.toml
+.env
+.env.*
+!.env.example
 
 # 模型权重缓存（DINOv2 / DINOv3 动辄数百 MB）
 models_cache/
@@ -24,6 +29,8 @@ models_cache/
 *.log
 
 # 筛重运行时产物（均在 output/ 下）
+output/*
+!output/bulk_unsub_controller.py
 output/__pycache__/
 output/we_dedup_cache.sqlite3
 output/we_dedup_cache.sqlite3-journal
@@ -35,3 +42,4 @@ output/duplicate_paths_*.xlsx
 output/diff_duplicate_paths_*.xlsx
 output/delisted_items.json
 output/delisted_unsub_*.xlsx
+output/unsub_progress.sqlite3*
