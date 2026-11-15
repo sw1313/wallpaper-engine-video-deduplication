@@ -13,6 +13,7 @@
 
     const archives = new Map();
     const originals = new WeakMap();
+    const archiveViews = new WeakMap();
     const archiveFields = ["file", "project", "type", "filesize", "filesizelabel",
         "local", "localAndExternal", "status", "weArchive"];
     let controller;
@@ -22,6 +23,77 @@
     let revision = 0;
     let lastLoggedCount = -1;
     let activeSelection;
+    let updatingWallpapers = false;
+    let rootScope;
+    const downloadUpdates = { received: 0, unchanged: 0 };
+    let pageRedrawsAvoided = 0;
+
+    function hasNativeTransfer(item) {
+        return item && ["pending", "downloading", "error"].includes(item.status);
+    }
+
+    function containsUpdate(record, update) {
+        // Native updates merge supplied fields, preserving omitted fields and array entries.
+        if (update === undefined || record === update) return true;
+        if (!record || !update || typeof record !== "object" || typeof update !== "object" ||
+            Array.isArray(record) !== Array.isArray(update)) return false;
+        return Object.keys(update).every(function (key) {
+            return containsUpdate(record[key], update[key]);
+        });
+    }
+
+    function changedDownloadUpdates(items) {
+        if (!controller || !["installed", "workshop"].includes(controller.source) || !rootScope || items.length < 50) return items;
+        const seenIds = new Set();
+        const duplicateIds = new Set();
+        items.forEach(function (item) {
+            if (!item || !item.workshopid) return;
+            if (seenIds.has(item.workshopid)) duplicateIds.add(item.workshopid);
+            seenIds.add(item.workshopid);
+        });
+        const records = new Map();
+        controller.wallpapers.forEach(function (item) {
+            if (!item.workshopid) return;
+            if (!records.has(item.workshopid)) records.set(item.workshopid, []);
+            records.get(item.workshopid).push(item);
+        });
+        const changed = items.filter(function (item) {
+            if (!item || !item.workshopid || item.local || item.ispreset || duplicateIds.has(item.workshopid) ||
+                !["pending", "downloading"].includes(item.status)) return true;
+            const existing = records.get(item.workshopid);
+            return !existing || existing.some(function (record) {
+                return record === item || record.ispreset || !containsUpdate(record, item);
+            });
+        });
+        downloadUpdates.received += items.length;
+        downloadUpdates.unchanged += items.length - changed.length;
+        if (changed.length === items.length) return items;
+        // Preserve the full native progress event, including unchanged queued downloads.
+        rootScope.$broadcast("onSteamItemsUpdated", items);
+        return changed;
+    }
+
+    function updatesOutsideCurrentPage(items) {
+        if (!["installed", "workshop"].includes(controller.source) || !items.length) return false;
+        const visibleIds = new Set([controller.currentSelection].concat(
+            controller.queryWallpapers || [], controller.sortedWallpapers || []
+        ).filter(Boolean).map(function (item) { return item.workshopid; }));
+        return items.every(function (item) {
+            return item && item.workshopid && !item.local && !item.ispreset &&
+                ["pending", "downloading", "installed", "error", "unsubscribed"].includes(item.status) &&
+                !visibleIds.has(item.workshopid);
+        });
+    }
+
+    function protectedArchive(id) {
+        const archive = lookup(id);
+        if (!archive || !archive.archiveVerified) return false;
+        const visible = [controller.currentSelection].concat(controller.queryWallpapers || []);
+        return visible.some(function (item) {
+            return item && String(item.workshopid) === String(id) && item.weArchive &&
+                item.status === "installed" && normalizedPath(item.file) === normalizedPath(archive.file);
+        });
+    }
 
     function isWorkshop() {
         return Boolean(controller && controller.source === "workshop");
@@ -83,6 +155,12 @@
 
     function apply(item) {
         if (!item || !item.workshopid || item.ispreset) return item;
+        if (hasNativeTransfer(item)) {
+            const nativeStatus = item.status;
+            restore(item);
+            item.status = nativeStatus;
+            return item;
+        }
         const archive = lookup(item.workshopid);
         if (!archive || !archive.archiveVerified) {
             restore(item);
@@ -112,11 +190,12 @@
     }
 
     function resolveResults(result) {
+        if (!isWorkshop()) return result;
         if (!result || !Array.isArray(result.wallpapers)) {
             return applyResults(result);
         }
         const candidates = Array.from(new Set(result.wallpapers.map(function (item) {
-            return lookup(item.workshopid);
+            return hasNativeTransfer(item) ? undefined : lookup(item.workshopid);
         }).filter(Boolean)));
         if (!candidates.length) return applyResults(result);
         return host.callDeferredSerialized("browseWallpaperObject", "getLocalFileSizes",
@@ -144,15 +223,26 @@
 
     function refresh() {
         if (!isWorkshop()) return;
-        const copies = new Map();
+        const installedRecords = new Set(controller.wallpapers);
+        let changed = false;
         function viewItem(item) {
+            if (!item || (!lookup(item.workshopid) && !originals.has(item))) return item;
+            const previous = item;
+            const before = archiveFields.map(function (field) { return item[field]; });
             // WE replaces query results with installed records by ID. Keep the
             // archive overlay on a query copy, preserving the installed record.
-            if (item && lookup(item.workshopid) && controller.wallpapers.includes(item)) {
-                if (!copies.has(item)) copies.set(item, Object.assign({}, item));
-                item = copies.get(item);
+            if (lookup(item.workshopid) && !hasNativeTransfer(item) && installedRecords.has(item)) {
+                if (!archiveViews.has(item)) archiveViews.set(item, Object.assign({}, item));
+                const view = archiveViews.get(item);
+                restore(view);
+                Object.assign(view, item);
+                item = view;
             }
-            return apply(item);
+            apply(item);
+            changed = changed || previous !== item || archiveFields.some(function (field, index) {
+                return item[field] !== before[index];
+            });
+            return item;
         }
         [controller.queryWallpapers, controller.sortedWallpapers].forEach(function (items) {
             if (!items) return;
@@ -160,7 +250,7 @@
         });
         controller.currentSelection = viewItem(controller.currentSelection);
         // The thumbnail directive observes array identity when it redraws badges.
-        controller.sortedWallpapers = (controller.sortedWallpapers || []).slice();
+        if (changed) controller.sortedWallpapers = (controller.sortedWallpapers || []).slice();
     }
 
     function logStats() {
@@ -169,12 +259,13 @@
         window.ui.logError("[WEArchiveBridge] " + JSON.stringify(api.getStats()));
     }
 
-    function verifyArchive(item) {
+    function verifyArchive(item, isCurrent) {
         const archive = lookup(item.workshopid);
         if (!archive) return q.when(true);
         const file = archive.file;
         return host.callDeferredSerialized("browseWallpaperObject", "getLocalFileSizes", [file])
             .then(function (sizes) {
+                if (!isCurrent()) return false;
                 const found = Object.keys(sizes || {}).find(function (key) {
                     return normalizedPath(key) === normalizedPath(file);
                 });
@@ -185,7 +276,7 @@
                 removeFile(file);
                 refresh();
                 // A backup may still be available after the preferred copy was removed.
-                if (lookup(item.workshopid)) return verifyArchive(item);
+                if (lookup(item.workshopid)) return verifyArchive(item, isCurrent);
                 restore(item);
                 item.status = "downloadable";
                 dialogs.open("genericConfirm", {
@@ -205,25 +296,70 @@
         value.weArchiveBridgeAttached = true;
         const update = value.updateWallpapers;
         value.updateWallpapers = function (items) {
+            const args = Array.from(arguments);
+            const previousList = controller.sortedWallpapers;
+            const previousQuery = controller.queryWallpapers;
+            const previousSelection = controller.currentSelection;
+            const previousSource = controller.source;
+            // WE sends recurring download ticks as updateWallpapers(items, false).
+            // The true flag remains a full synchronous native initialization update.
+            const progressUpdate = args.length === 1 || (args.length === 2 && args[1] === false);
+            const backgroundOnly = progressUpdate && Array.isArray(items) && updatesOutsideCurrentPage(items);
+            if (progressUpdate && Array.isArray(items)) {
+                args[0] = changedDownloadUpdates(items);
+                if (!args[0].length && items.length) return;
+            }
             // Native records retain their identity so folder membership keeps using file paths.
-            indexArchives(items);
-            const result = update.apply(this, arguments);
+            indexArchives(args[0]);
+            let result;
+            const previousUpdating = updatingWallpapers;
+            updatingWallpapers = true;
+            try {
+                result = update.apply(this, args);
+            } finally { updatingWallpapers = previousUpdating; }
             refresh();
+            // Native download ticks copy the thumbnail array even when every visible
+            // item is unrelated. Preserve it so menus and tiles stay stable.
+            if (backgroundOnly && controller.source === previousSource && controller.queryWallpapers === previousQuery &&
+                controller.currentSelection === previousSelection && Array.isArray(previousList) &&
+                previousList !== controller.sortedWallpapers &&
+                previousList.length === controller.sortedWallpapers.length &&
+                previousList.every(function (item, index) { return item === controller.sortedWallpapers[index]; })) {
+                controller.sortedWallpapers = previousList;
+                pageRedrawsAvoided += 1;
+            }
             logStats();
             return result;
         };
         const select = value.callbackWallpaperSelected;
         let pendingSelection = 0;
         value.callbackWallpaperSelected = function (item) {
+            const current = controller.currentSelection;
+            const archive = item && lookup(item.workshopid);
+            // Native list reconciliation reselects aliased records on every download tick.
+            // Keep an already selected archive instead of reloading it and its author details.
+            if (updatingWallpapers && isWorkshop() && current && current.weArchive &&
+                item && !item.ispreset && !hasNativeTransfer(item) && archive &&
+                current.workshopid === item.workshopid &&
+                normalizedPath(current.file) === normalizedPath(archive.file)) return;
             const ticket = ++pendingSelection;
             if (activeSelection) activeSelection.done.resolve(false);
             activeSelection = undefined;
             const context = this;
-            if (!isWorkshop() || !item || !lookup(item.workshopid)) return select.apply(context, arguments);
+            if (!isWorkshop() || !item || item.ispreset || hasNativeTransfer(item) ||
+                String(item.type).toLowerCase() !== "video" || !lookup(item.workshopid)) {
+                return select.apply(context, arguments);
+            }
             const selection = { done: q.defer() };
             activeSelection = selection;
-            return verifyArchive(item).then(function (available) {
-                if (ticket !== pendingSelection) return false;
+            function isCurrent() {
+                return ticket === pendingSelection && isWorkshop();
+            }
+            return verifyArchive(item, isCurrent).then(function (available) {
+                if (!isCurrent()) {
+                    selection.done.resolve(false);
+                    return false;
+                }
                 if (!available) {
                     selection.done.resolve(false);
                     return select.call(context, item);
@@ -248,14 +384,20 @@
             const context = this;
             const args = arguments;
             if (applyAndClose && isWorkshop() && activeSelection) {
-                return activeSelection.done.promise.then(function (loaded) {
-                    if (loaded) {
+                const selection = activeSelection;
+                function isCurrentArchive() {
+                    const current = controller.currentSelection;
+                    return activeSelection === selection && isWorkshop() && current && current.weArchive &&
+                        normalizedPath(current.file) === normalizedPath(selection.file);
+                }
+                return selection.done.promise.then(function (loaded) {
+                    if (loaded && isCurrentArchive()) {
                         // Submit native apply-and-close after the archive selection
                         // has left its file-size callback and Angular continuation.
                         const submitted = q.defer();
                         window.setTimeout(function () {
                             try {
-                                accept.apply(context, args);
+                                if (isCurrentArchive()) accept.apply(context, args);
                                 submitted.resolve();
                             } catch (error) { submitted.reject(error); }
                         }, 50);
@@ -267,13 +409,20 @@
         };
         // A query may finish after the first native archive batch or use a backup service.
         value.$watchCollection("queryWallpapers", refresh);
+        value.$watch("source", function (source) {
+            if (source === "workshop") return;
+            pendingSelection += 1;
+            if (activeSelection) activeSelection.done.resolve(false);
+            activeSelection = undefined;
+        });
     }
 
     const api = {
-        version: "1.0.4",
+        version: "1.0.10",
         getStats: function () {
             return { version: api.version, archives: archives.size, revision: revision,
-                attached: Boolean(controller), source: controller && controller.source };
+                attached: Boolean(controller), source: controller && controller.source,
+                downloadUpdates: Object.assign({}, downloadUpdates), pageRedrawsAvoided: pageRedrawsAvoided };
         },
         lookup: lookup
     };
@@ -304,16 +453,16 @@
                 host[name] = function (object, method) {
                     const args = Array.from(arguments);
                     if (isWorkshop() && object === "ui" && method === "subscribeWorkshopItem" && Array.isArray(args[2])) {
-                        args[2] = args[2].filter(function (id) { return !lookup(id); });
-                        if (!args[2].length) {
-                            refresh();
-                            return q.when();
+                        const allowed = args[2].filter(function (id) { return !protectedArchive(id); });
+                        if (allowed.length !== args[2].length) {
+                            if (!allowed.length) return q.when();
+                            args[2] = allowed;
                         }
                     }
                     if (isWorkshop() && object === "browseWallpaperObject" && method === "selectWallpaper") {
                         const match = normalizedPath(args[2]).match(/\/workshop\/content\/431960\/(\d+)\//);
                         const archive = match && lookup(match[1]);
-                        if (archive) args[2] = archive.file;
+                        if (archive && protectedArchive(match[1])) args[2] = archive.file;
                     }
                     const result = original.apply(this, args);
                     if (isWorkshop() && object === "browseWallpaperObject" && method === "selectWallpaper" &&
@@ -332,8 +481,9 @@
             return host;
         }]);
     }]);
-    app.run(["$q", "modals", "$templateCache", function ($q, modals, templates) {
+    app.run(["$q", "modals", "$templateCache", "$rootScope", function ($q, modals, templates, $rootScope) {
         q = $q;
+        rootScope = $rootScope;
         dialogs = modals;
         const key = "views/views/browsewallpapers.html";
         const template = templates.get(key);

@@ -12,7 +12,7 @@ Wallpaper Engine 创意工坊视频筛重 + 批量取消订阅 + **已下架物�
 
 ### Windows 便携版
 
-下载 1.1.0 Release 中全部 `WEVideoTools-1.1.0-windows-x64.7z.*` 分卷，放在同一目录，用 7-Zip 打开 `.7z.001` 并解压。启动解压目录中的 `WEVideoTools.exe`。发布文件附有 SHA-256 校验表。[下载 Release](https://github.com/sw1313/wallpaper-engine-video-deduplication/releases/latest)
+下载 1.1.1 Release 中全部 `WEVideoTools-1.1.1-windows-x64.7z.*` 分卷，放在同一目录，用 7-Zip 打开 `.7z.001` 并解压。启动解压目录中的 `WEVideoTools.exe`。发布文件附有 SHA-256 校验表。[下载 Release](https://github.com/sw1313/wallpaper-engine-video-deduplication/releases/latest)
 
 便携版支持 Windows 10 / 11 x64，包含 Python 3.13、Qt 6 与基础查重依赖。启动时会检查 ffmpeg、ffprobe 和可选的 fpcalc。请自行安装工具并加入 PATH，也可在界面填写对应程序的完整路径。
 
@@ -23,6 +23,13 @@ Wallpaper Engine 创意工坊视频筛重 + 批量取消订阅 + **已下架物�
 首次启动请填写创意工坊目录与 WE 安装目录。Steam API Key 可在「下架归档」页填写。配置模板使用通用示例路径，输出目录 `output` 和模型缓存目录 `models_cache` 均相对于程序所在目录解析。
 
 升级时将新版解压到独立目录，再复制自己的 `config.toml`、`output/`、`models_cache/` 和已安装的 `runtime/`。保留 `output/unsub_progress.sqlite3` 可继续之前的取消订阅任务，保留 `output/we_dedup_cache.sqlite3` 可复用已计算的签名。将 Tampermonkey 脚本更新到随包的 **20.2.0**。
+
+### 1.1.1 更新内容
+
+- 优化 WE 已安装页和创意工坊页的下载状态更新，大量本地视频与下载队列并存时，仅处理发生变化的下载记录，减少右键菜单和上传者信息显示的等待。
+- 支持 WE 实际使用的双参数下载更新调用，保留下载进度、完成、错误和取消订阅事件。
+- 减少后台下载引起的当前页缩略图重绘，稳定普通未订阅项目与归档项目的选中状态。
+- 收紧归档订阅拦截与路径重定向范围，修复切换页面后遗留的归档加载、弹窗和延迟关闭操作。
 
 ### 1.1.0 更新内容
 
@@ -76,7 +83,7 @@ py -3.13 -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -r requirements-semantic.txt
 ```
 
-执行 `./build.ps1` 可重新打包，打包环境还需安装 `pyinstaller>=6.16`。通过 `./build.ps1 -ReleaseVersion 1.1.0` 可生成公开发布用的 7-Zip 分卷，需要 `7z` 命令位于 PATH 中。公开包从配置模板生成配置，包含运行程序与工具脚本。发布脚本会排除本机配置、输出数据、语义运行库、外部工具和模型权重。
+执行 `./build.ps1` 可重新打包，打包环境还需安装 `pyinstaller>=6.16`。通过 `./build.ps1 -ReleaseVersion 1.1.1` 可生成公开发布用的 7-Zip 分卷，需要 `7z` 命令位于 PATH 中。公开包从配置模板生成配置，包含运行程序与工具脚本。发布脚本会排除本机配置、输出数据、语义运行库、外部工具和模型权重。
 
 界面通过侧栏切换三个功能，查重参数按组显示，支持中文名称与配置键搜索。鼠标悬停参数名称可查看详细说明。
 
@@ -182,6 +189,10 @@ python bulk_unsub_controller.py --xlsx duplicates_xxx.xlsx --batch-size 1 --sing
 
 在 WE 的「创意工坊」页，已验证可用的归档视频会显示本地文件图标，侧栏显示「已订阅」。单击直接加载归档视频，双击应用并调用 WE 原生关闭流程。补丁会过滤这些归档项的重复订阅请求。此标记表示本地归档可用，Steam 账号的实际订阅记录由 Steam 管理。
 
+非归档项目使用 WE 原生订阅提示、下载状态和缩略图上的圆形下载进度条。下载中的项目与尚未验证可用的归档索引保留原生处理流程。
+
+补丁同时优化「已安装」和「创意工坊」页的大批量下载状态更新，过滤完全相同的排队与下载记录，并减少无关的缩略图重绘。普通未订阅项目的右键菜单与上传者信息可在后台下载期间保持响应，上传者资料的获取时间取决于 Steam 的网络响应。
+
 在脚本所在目录打开 PowerShell，替换示例中的 WE 安装目录后运行。
 
 ```powershell
@@ -195,7 +206,7 @@ python bulk_unsub_controller.py --xlsx duplicates_xxx.xlsx --batch-size 1 --sing
 .\we_archive_bridge.ps1 -Action Uninstall -InstallDir "E:\SteamLibrary\steamapps\common\wallpaper_engine"
 ```
 
-重新打开 WE 窗口后生效。安装脚本会备份界面入口文件，卸载时移除补丁入口。WE 更新覆盖界面文件后，可再次执行安装命令。新增归档可由 WE 运行时扫描识别，也可重装补丁以刷新启动索引。
+安装完成后，完全退出并重新启动 Wallpaper Engine，使新的浏览进程加载补丁。大型本地项目库需要等待 WE 扫描完成。安装脚本会备份界面入口文件，卸载时移除补丁入口。WE 更新覆盖界面文件后，可再次执行安装命令。新增归档可由 WE 运行时扫描识别，也可重装补丁以刷新启动索引。
 
 已验证的界面版本为 **Wallpaper Engine 2.8.797**。部分环境中，WE 原生「应用并关闭」会长时间卡顿，官方订阅项目也可复现。本版本沿用该原生关闭流程，这个问题仍待 WE 侧处理。
 
