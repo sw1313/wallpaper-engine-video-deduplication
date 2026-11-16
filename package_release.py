@@ -15,7 +15,7 @@ import tomllib
 ROOT_FILES = (
     "WEVideoTools.exe", "WEWorker.exe", "config.example.toml",
     "wallpaper-engine-video-deduplication.js", "we_archive_bridge.js",
-    "we_archive_bridge.ps1", "LICENSE",
+    "we_archive_bridge.ps1", "we_workshop_guard.ps1", "LICENSE",
 )
 WEIGHT_SUFFIXES = {".pt", ".pth", ".ckpt", ".safetensors", ".gguf", ".onnx"}
 
@@ -77,6 +77,8 @@ def main() -> None:
         "output 保存筛重数据库、结果表和取消订阅重试进度。\n"
         "批量取消订阅需要浏览器登录 Steam，并安装随包的 Tampermonkey 脚本。\n"
         "创意工坊归档识别补丁的安装、重装和还原方法见 README.md。\n\n"
+        "后台逐项下载：在 PowerShell 运行 .\\we_workshop_guard.ps1 -Action Start。\n"
+        "使用 -Action Status 查看进度，-Action Stop 停止，具体说明见 README.md。\n\n"
         "升级时将新版解压到独立目录，再复制自己的 config.toml、output 和 models_cache。\n",
         encoding="utf-8",
     )

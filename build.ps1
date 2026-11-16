@@ -22,7 +22,7 @@ foreach ($conflictingDll in @('_internal\icuuc.dll', '_internal\icudt78.dll')) {
     $dllPath = Join-Path $packagePath $conflictingDll
     if (Test-Path -LiteralPath $dllPath) { Remove-Item -LiteralPath $dllPath }
 }
-Copy-Item -LiteralPath 'config.example.toml','wallpaper-engine-video-deduplication.js','we_archive_bridge.js','we_archive_bridge.ps1','LICENSE' -Destination $packagePath -Force
+Copy-Item -LiteralPath 'config.example.toml','wallpaper-engine-video-deduplication.js','we_archive_bridge.js','we_archive_bridge.ps1','we_workshop_guard.ps1','LICENSE' -Destination $packagePath -Force
 $localConfig = Join-Path $packagePath 'config.toml'
 if (-not (Test-Path -LiteralPath $localConfig)) {
     Copy-Item -LiteralPath 'config.example.toml' -Destination $localConfig

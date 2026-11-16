@@ -33,6 +33,8 @@ def main() -> None:
             from bulk_unsub_controller import main as run
         elif worker == "semantic_runtime.py":
             from semantic_runtime import main as run
+        elif worker == "we_workshop_guard.py":
+            from we_workshop_guard import main as run
         else:
             raise SystemExit(f"Unknown worker: {worker}")
         run()
