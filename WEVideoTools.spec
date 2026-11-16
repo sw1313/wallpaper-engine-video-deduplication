@@ -51,4 +51,5 @@ pyz = PYZ(a.pure)
 runtime_options = [("X utf8", None, "OPTION")]
 gui = EXE(pyz, a.scripts, runtime_options, exclude_binaries=True, name="WEVideoTools", console=False, upx=False)
 worker = EXE(pyz, a.scripts, runtime_options, exclude_binaries=True, name="WEWorker", console=True, upx=False)
-coll = COLLECT(gui, worker, a.binaries, a.datas, strip=False, upx=False, name="WEVideoTools")
+guard = EXE(pyz, a.scripts, runtime_options, exclude_binaries=True, name="WEWorkshopGuard", console=False, upx=False)
+coll = COLLECT(gui, worker, guard, a.binaries, a.datas, strip=False, upx=False, name="WEVideoTools")

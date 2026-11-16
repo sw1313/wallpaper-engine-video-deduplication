@@ -1,10 +1,11 @@
 from types import SimpleNamespace
 from pathlib import Path
 import sys
+import tempfile
 import unittest
 from unittest.mock import patch
 
-from we_workshop_guard import DownloadQueue, background_command
+from we_workshop_guard import DownloadQueue, background_command, read_status, run, run_session, write_status
 
 
 class FakeSession:
@@ -117,6 +118,109 @@ class BackgroundCommandTests(unittest.TestCase):
         self.assertTrue(command[3].endswith('we_workshop_guard.py'))
         self.assertEqual(command[4], 'run')
         self.assertNotIn('--sequential', command)
+
+    def test_tray_uses_console_worker_for_hidden_background_commands(self):
+        with patch.object(sys, 'frozen', True, create=True), patch.object(sys, 'executable', 'WEWorkshopGuard.exe'):
+            command = background_command(Path('E:/WE'), Path('output'), '', True)
+        self.assertEqual(command[0], 'WEWorker.exe')
+
+
+class HandoffTests(unittest.TestCase):
+    def test_pause_releases_session_and_ui_handoff_resumes_after_closing(self):
+        with tempfile.TemporaryDirectory() as temp:
+            directory = Path(temp)
+            args = SimpleNamespace(state_dir=directory, install_dir=directory, instance='test', sequential=True)
+            children, states = [], []
+            clock = [100]
+            ui = [False]
+
+            class Child:
+                def __init__(self, *arguments, **keywords):
+                    self.returncode = None
+                    children.append(self)
+                    write_status(args, 'active', steam_session=True, downloads={'completed': 7})
+
+                def poll(self):
+                    if (directory / 'workshop_guard_session.stop').exists():
+                        self.wait()
+                    return self.returncode
+
+                def wait(self, timeout=None):
+                    self.returncode = 0
+                    write_status(args, 'releasing', steam_session=False, downloads={'completed': 7})
+                    return 0
+
+            def step(delay):
+                states.append(read_status(directory))
+                clock[0] += 2
+                if len(states) == 1:
+                    (directory / 'workshop_guard.pause').touch()
+                elif len(states) == 2:
+                    self.assertEqual(states[-1]['state'], 'active')
+                elif len(states) == 3:
+                    self.assertEqual(children[0].returncode, 0)
+                    (directory / 'workshop_guard.pause').unlink()
+                    ui[0] = True
+                elif len(states) == 4:
+                    self.assertEqual(len(children), 1)
+                    ui[0] = False
+                else:
+                    (directory / 'workshop_guard.stop').touch()
+
+            with patch('we_workshop_guard.subprocess.Popen', Child), \
+                    patch('we_workshop_guard.we_ui_running', side_effect=lambda install: ui[0]), \
+                    patch('we_workshop_guard.time.monotonic', side_effect=lambda: clock[0]), \
+                    patch('we_workshop_guard.time.sleep', side_effect=step):
+                run(args)
+            self.assertEqual([state['state'] for state in states], ['active', 'active', 'paused', 'yielding_to_we', 'active'])
+            self.assertFalse(states[2]['steam_session'])
+            self.assertFalse(states[3]['steam_session'])
+            self.assertEqual(states[2]['downloads']['completed'], 7)
+            self.assertEqual(len(children), 2)
+            self.assertTrue(all(child.returncode == 0 for child in children))
+            self.assertEqual(read_status(directory)['state'], 'stopped')
+
+    def test_starting_with_we_ui_open_does_not_open_another_steam_session(self):
+        with tempfile.TemporaryDirectory() as temp:
+            directory = Path(temp)
+            args = SimpleNamespace(state_dir=directory, install_dir=directory, instance='test', sequential=True)
+            with patch('we_workshop_guard.subprocess.Popen') as child, \
+                    patch('we_workshop_guard.we_ui_running', return_value=True), \
+                    patch('we_workshop_guard.time.sleep', side_effect=lambda delay: (directory / 'workshop_guard.stop').touch()):
+                run(args)
+            child.assert_not_called()
+
+    def test_session_preserves_completion_and_retry_state_across_pause(self):
+        with tempfile.TemporaryDirectory() as temp:
+            directory = Path(temp)
+            args = SimpleNamespace(state_dir=directory, install_dir=directory, instance='test', sequential=True)
+            write_status(args, 'paused', downloads={'completed': 7}, retry_at={'22': 9999})
+
+            class Session(FakeSession):
+                def __init__(self, install):
+                    super().__init__()
+                    self.initialized = False
+                    self.api.SteamAPI_IsSteamRunning = lambda: True
+
+                def connect(self):
+                    self.initialized = True
+
+                def callbacks(self):
+                    return []
+
+                def close(self):
+                    self.initialized = False
+
+            session = Session(directory)
+            with patch('we_workshop_guard.SteamSession', return_value=session), \
+                    patch('we_workshop_guard.time.monotonic', return_value=100), \
+                    patch('we_workshop_guard.time.sleep', side_effect=lambda delay: (directory / 'workshop_guard.pause').touch()):
+                run_session(args)
+            data = read_status(directory)
+            self.assertFalse(session.initialized)
+            self.assertEqual(data['downloads']['completed'], 7)
+            self.assertEqual(data['downloads']['deferred'], 1)
+            self.assertEqual(session.requests, [(33, True)])
 
 
 if __name__ == '__main__':

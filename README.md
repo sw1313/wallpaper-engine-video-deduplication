@@ -12,7 +12,7 @@ Wallpaper Engine 创意工坊视频筛重 + 批量取消订阅 + **已下架物�
 
 ### Windows 便携版
 
-下载 1.1.2 Release 中全部 `WEVideoTools-1.1.2-windows-x64.7z.*` 分卷，放在同一目录，用 7-Zip 打开 `.7z.001` 并解压。启动解压目录中的 `WEVideoTools.exe`。发布文件附有 SHA-256 校验表。[下载 Release](https://github.com/sw1313/wallpaper-engine-video-deduplication/releases/latest)
+下载 1.1.3 Release 中全部 `WEVideoTools-1.1.3-windows-x64.7z.*` 分卷，放在同一目录，用 7-Zip 打开 `.7z.001` 并解压。启动解压目录中的 `WEVideoTools.exe`。发布文件附有 SHA-256 校验表。[下载 Release](https://github.com/sw1313/wallpaper-engine-video-deduplication/releases/latest)
 
 便携版支持 Windows 10 / 11 x64，包含 Python 3.13、Qt 6 与基础查重依赖。启动时会检查 ffmpeg、ffprobe 和可选的 fpcalc。请自行安装工具并加入 PATH，也可在界面填写对应程序的完整路径。
 
@@ -23,6 +23,13 @@ Wallpaper Engine 创意工坊视频筛重 + 批量取消订阅 + **已下架物�
 首次启动请填写创意工坊目录与 WE 安装目录。Steam API Key 可在「下架归档」页填写。配置模板使用通用示例路径，输出目录 `output` 和模型缓存目录 `models_cache` 均相对于程序所在目录解析。
 
 升级时将新版解压到独立目录，再复制自己的 `config.toml`、`output/`、`models_cache/` 和已安装的 `runtime/`。保留 `output/unsub_progress.sqlite3` 可继续之前的取消订阅任务，保留 `output/we_dedup_cache.sqlite3` 可复用已计算的签名。将 Tampermonkey 脚本更新到随包的 **20.2.0**。
+
+### 1.1.3 更新内容
+
+- 新增 `WEWorkshopGuard.exe` 托盘入口，可查看下载状态、暂停、恢复和退出。
+- 状态窗口支持恢复到前台，运行日志在同一窗口的日志页内自动刷新。
+- 暂停会结束持有 Steam 会话的子进程，释放 Steam 的程序运行状态，方便从 Steam 启动 WE。
+- 检测到 WE 主界面时自动让出，界面进程结束后自动恢复后台逐项下载。
 
 ### 1.1.2 更新内容
 
@@ -220,7 +227,13 @@ python bulk_unsub_controller.py --xlsx duplicates_xxx.xlsx --batch-size 1 --sing
 
 当大量订阅在 WE 主 UI 关闭后被 Steam 集中安排下载时，可启用后台工具维持 Wallpaper Engine 的 Steam 会话，并以单项目高优先级请求推进下载队列。每项收到成功回调后才继续下一项，失败项目等待 5 分钟后重试。
 
-需要 Windows、Steam 客户端以及当前账号拥有的 Wallpaper Engine。先在程序中保存 WE 安装目录，或通过 `-InstallDir` 指定该目录。在程序目录打开 PowerShell 后运行以下命令，便携版和源码版使用相同入口。
+需要 Windows、Steam 客户端以及当前账号拥有的 Wallpaper Engine。便携版双击 `WEWorkshopGuard.exe` 启动，保留同目录的 `WEWorker.exe` 和 `_internal/`。首次运行可选择 WE 安装目录，也会读取主程序保存的配置。
+
+右键托盘图标可查看运行状态、启动或恢复、暂停、设置 WE 安装目录、查看运行日志和退出。状态窗口显示当前项目、字节进度、本次完成数和延后重试数，日志页显示最近 128 KB 的日志并每秒刷新。关闭状态窗口会收起到托盘，重复打开程序会唤出已有实例的状态窗口。
+
+需要从 Steam 启动 WE 时，先选择「暂停（释放 Steam 占用）」，等状态变为「已暂停」。暂停会结束持有 Steam 会话的下载子进程，托盘继续运行。选择「启动 / 恢复」后重新接管。自动模式检测到 WE 主界面时会让出，主界面及其清理进程结束后自动恢复。手动暂停期间会一直保持暂停。
+
+命令行也可控制后台工具。先在程序中保存 WE 安装目录，或通过 `-InstallDir` 指定该目录。在程序目录打开 PowerShell 后运行以下命令，便携版和源码版使用相同入口。
 
 ```powershell
 # 启动后台逐项下载，随后可关闭 WE 主 UI
@@ -232,13 +245,17 @@ python bulk_unsub_controller.py --xlsx duplicates_xxx.xlsx --batch-size 1 --sing
 # 查看运行状态、当前项目、下载字节数和本次成功数量
 .\we_workshop_guard.ps1 -Action Status
 
+# 暂停并释放 Steam 占用，再恢复自动接管
+.\we_workshop_guard.ps1 -Action Pause
+.\we_workshop_guard.ps1 -Action Resume
+
 # 停止后台工具
 .\we_workshop_guard.ps1 -Action Stop
 ```
 
-运行期间 Steam 会显示 Wallpaper Engine 正在运行。状态与日志保存在程序目录的 `output/workshop_guard.json` 和 `output/workshop_guard.log`。Steam 完全退出后，后台工具会结束，重新启动 Steam 后可再次运行启动命令。
+源码版可运行 `.\.venv\Scripts\python.exe launcher.py --workshop-tray` 打开托盘。后台接管期间 Steam 会显示 Wallpaper Engine 正在运行。状态与日志保存在程序目录的 `output/workshop_guard.json` 和 `output/workshop_guard.log`。Steam 完全退出后，下载子进程会结束，重新启动 Steam 后可从托盘再次启动。
 
-高优先级请求可能暂缓其他 Steam 下载。停止后台工具会释放运行状态，Steam 可能恢复集中调度。Steam 仍可能对异常文件进行验证，该工具的作用是控制下载请求方式，实际调度由 Steam 执行。
+高优先级请求可能暂缓其他 Steam 下载。暂停或退出会释放运行状态，Steam 可能恢复集中调度。暂停控制本工具的下载请求，Steam 自身的下载任务仍由客户端控制。Steam 仍可能对异常文件进行验证，该工具的作用是控制下载请求方式，实际调度由 Steam 执行。
 
 ## 配置说明
 
@@ -435,6 +452,7 @@ DINO 的 per-frame 全局距离只能告诉你"两段视频差多少"，但分�
 ├── we_archive_bridge.ps1             # WE 创意工坊归档补丁管理
 ├── we_archive_bridge.js              # 归档状态映射与加载路径处理
 ├── we_workshop_guard.py              # Steam 会话与后台逐项下载
+├── we_workshop_tray.py               # 后台下载托盘与状态窗口
 ├── we_workshop_guard.ps1             # 便携版与源码版的后台下载入口
 ├── tests/                           # 回归测试
 ├── output/

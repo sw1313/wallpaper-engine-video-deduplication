@@ -1,6 +1,6 @@
 """Keep Wallpaper Engine's licensed Steam session active without opening its browser.
 
-Run with ``start``, ``status`` or ``stop``. Stopping releases the Steam session,
+Run with ``start``, ``status``, ``pause``, ``resume`` or ``stop``. Pausing releases the Steam session,
 so Steam may resume its normal background Workshop scheduling.
 """
 from __future__ import annotations
@@ -17,6 +17,7 @@ import sys
 import time
 import tomllib
 import uuid
+from ctypes import wintypes
 
 
 APP_ID = 431960
@@ -34,11 +35,11 @@ class DownloadResult(ctypes.Structure):
 
 
 @contextmanager
-def session_lock(directory: Path):
+def session_lock(directory: Path, filename: str = 'workshop_guard.lock'):
     import msvcrt
 
     directory.mkdir(parents=True, exist_ok=True)
-    with (directory / 'workshop_guard.lock').open('a+b') as lock:
+    with (directory / filename).open('a+b') as lock:
         if lock.tell() == 0:
             lock.write(b'0')
             lock.flush()
@@ -67,6 +68,56 @@ def steam_directory() -> Path:
 
     with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r'Software\Valve\Steam') as key:
         return Path(winreg.QueryValueEx(key, 'SteamPath')[0])
+
+
+def we_ui_running(install: Path) -> bool:
+    """Include browser/editor cleanup processes so Steam retains ownership during handoff."""
+    class ProcessEntry(ctypes.Structure):
+        _fields_ = [
+            ('dwSize', wintypes.DWORD), ('cntUsage', wintypes.DWORD),
+            ('th32ProcessID', wintypes.DWORD), ('th32DefaultHeapID', ctypes.c_size_t),
+            ('th32ModuleID', wintypes.DWORD), ('cntThreads', wintypes.DWORD),
+            ('th32ParentProcessID', wintypes.DWORD), ('pcPriClassBase', wintypes.LONG),
+            ('dwFlags', wintypes.DWORD), ('szExeFile', wintypes.WCHAR * 260),
+        ]
+
+    kernel = ctypes.WinDLL('kernel32', use_last_error=True)
+    kernel.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
+    kernel.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+    kernel.Process32FirstW.argtypes = [wintypes.HANDLE, ctypes.POINTER(ProcessEntry)]
+    kernel.Process32FirstW.restype = wintypes.BOOL
+    kernel.Process32NextW.argtypes = [wintypes.HANDLE, ctypes.POINTER(ProcessEntry)]
+    kernel.Process32NextW.restype = wintypes.BOOL
+    kernel.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel.OpenProcess.restype = wintypes.HANDLE
+    kernel.QueryFullProcessImageNameW.argtypes = [wintypes.HANDLE, wintypes.DWORD, wintypes.LPWSTR, ctypes.POINTER(wintypes.DWORD)]
+    kernel.QueryFullProcessImageNameW.restype = wintypes.BOOL
+    kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel.CloseHandle.restype = wintypes.BOOL
+    snapshot = kernel.CreateToolhelp32Snapshot(2, 0)
+    if snapshot == ctypes.c_void_p(-1).value:
+        raise ctypes.WinError(ctypes.get_last_error())
+    expected = os.path.normcase(os.path.realpath(install / 'bin' / 'wallpaperui.exe'))
+    try:
+        entry = ProcessEntry()
+        entry.dwSize = ctypes.sizeof(entry)
+        found = kernel.Process32FirstW(snapshot, ctypes.byref(entry))
+        while found:
+            if entry.szExeFile.lower() == 'wallpaperui.exe':
+                process = kernel.OpenProcess(0x1000, False, entry.th32ProcessID)
+                if process:
+                    try:
+                        buffer = ctypes.create_unicode_buffer(32768)
+                        length = wintypes.DWORD(len(buffer))
+                        if kernel.QueryFullProcessImageNameW(process, 0, buffer, ctypes.byref(length)):
+                            if os.path.normcase(os.path.realpath(buffer.value)) == expected:
+                                return True
+                    finally:
+                        kernel.CloseHandle(process)
+            found = kernel.Process32NextW(snapshot, ctypes.byref(entry))
+        return False
+    finally:
+        kernel.CloseHandle(snapshot)
 
 
 class SteamSession:
@@ -214,74 +265,170 @@ class DownloadQueue:
                     last_result=self.last_result)
 
 
+def write_status(args, state, **fields):
+    data = dict(state=state, pid=os.getpid(), instance=args.instance, protocol=3,
+                app_id=APP_ID, time=datetime.now().isoformat(timespec='seconds'), **fields)
+    temporary = args.state_dir / f'workshop_guard.{os.getpid()}.tmp'
+    temporary.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding='utf-8')
+    for attempt in range(5):
+        try:
+            os.replace(temporary, args.state_dir / 'workshop_guard.json')
+            return
+        except PermissionError:
+            if attempt == 4:
+                raise
+            time.sleep(0.02)
+
+
+def run_session(args):
+    """Own the Steam API in an expendable process so pause releases Steam's running state."""
+    directory = args.state_dir
+    previous = read_status(directory)
+    session = None
+    queue = None
+    final_state = 'releasing'
+    message = ''
+
+    def write(state, **fields):
+        write_status(args, state, downloads=queue.status() if queue else previous.get('downloads'),
+                     retry_at=queue.retry_at if queue else previous.get('retry_at', {}), **fields)
+
+    try:
+        session = SteamSession(args.install_dir)
+        deadline = time.monotonic() + 300
+        launched_steam = False
+        next_status = 0
+        while not any((directory / marker).exists() for marker in (
+                'workshop_guard.stop', 'workshop_guard.pause', 'workshop_guard_session.stop')):
+            current = time.monotonic()
+            if not session.initialized:
+                error = session.connect()
+                if error is not None:
+                    write('waiting_for_steam', message=error, steam_session=False)
+                    if not launched_steam and not session.api.SteamAPI_IsSteamRunning():
+                        steam = steam_directory()
+                        subprocess.Popen([str(steam / 'steam.exe'), '-silent'], cwd=steam,
+                                         creationflags=subprocess.CREATE_NO_WINDOW)
+                        launched_steam = True
+                    if current >= deadline:
+                        raise RuntimeError('Timed out waiting for Steam. Sign in to Steam, then start again.')
+                    time.sleep(1)
+                    continue
+                if args.sequential:
+                    queue = DownloadQueue(session)
+                    queue.completed = (previous.get('downloads') or {}).get('completed', 0)
+                    queue.last_result = (previous.get('downloads') or {}).get('last_result')
+                    queue.retry_at = {int(item): until for item, until in previous.get('retry_at', {}).items()}
+            if not session.api.SteamAPI_IsSteamRunning():
+                final_state = 'steam_closed'
+                break
+            results = session.callbacks()
+            if queue:
+                queue.tick(results)
+            if time.monotonic() >= next_status:
+                write('active', logged_on=session.api.SteamAPI_ISteamUser_BLoggedOn(session.user),
+                      steam_session=True, we_ui_active=False,
+                      mode='sequential' if queue else 'session_only')
+                next_status = time.monotonic() + 1
+            time.sleep(0.1)
+    except Exception as error:
+        final_state = 'error'
+        message = str(error)
+        raise
+    finally:
+        if queue:
+            queue.active = None
+        if session:
+            session.close()
+        write(final_state, message=message, steam_session=False)
+
+
 def run(args):
+    """Keep controls alive without loading Steam into the supervising process."""
     directory = args.state_dir
     stop = directory / 'workshop_guard.stop'
+    paused = directory / 'workshop_guard.pause'
+    session_stop = directory / 'workshop_guard_session.stop'
     with session_lock(directory) as acquired:
         if not acquired:
             return
-
-        def write(state, **fields):
-            data = dict(state=state, pid=os.getpid(), instance=args.instance,
-                        app_id=APP_ID, time=datetime.now().isoformat(timespec='seconds'), **fields)
-            temporary = directory / 'workshop_guard.json.tmp'
-            temporary.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding='utf-8')
-            os.replace(temporary, directory / 'workshop_guard.json')
-
-        session = None
+        child = None
         final_state = 'stopped'
+        message = ''
+        write_status(args, 'starting', steam_session=False,
+                     mode='sequential' if args.sequential else 'session_only')
+        next_ui_check = 0
+        next_status = 0
+        ui_active = False
+        release_at = None
         try:
-            write('starting')
-            session = SteamSession(args.install_dir)
-            deadline = time.monotonic() + 300
-            launched_steam = False
             while not stop.exists():
-                error = session.connect()
-                if error is None:
-                    break
-                write('waiting_for_steam', message=error)
-                if not launched_steam and not session.api.SteamAPI_IsSteamRunning():
-                    steam = steam_directory()
-                    subprocess.Popen([str(steam / 'steam.exe'), '-silent'], cwd=steam,
-                                     creationflags=subprocess.CREATE_NO_WINDOW)
-                    launched_steam = True
-                if time.monotonic() >= deadline:
-                    raise RuntimeError('Timed out waiting for Steam. Sign in to Steam, then start again.')
-                time.sleep(1)
-            if stop.exists():
-                return
-            queue = DownloadQueue(session) if args.sequential else None
-            next_status = 0
-            while not stop.exists():
-                if not session.api.SteamAPI_IsSteamRunning():
-                    final_state = 'steam_closed'
-                    break
-                results = session.callbacks()
-                if queue:
-                    queue.tick(results)
-                if time.monotonic() >= next_status:
-                    write('active', logged_on=session.api.SteamAPI_ISteamUser_BLoggedOn(session.user),
-                          mode='sequential' if queue else 'session_only',
-                          downloads=queue.status() if queue else None)
-                    next_status = time.monotonic() + 5
+                current = time.monotonic()
+                if current >= next_ui_check:
+                    ui_active = we_ui_running(args.install_dir)
+                    next_ui_check = current + 1
+                state = 'paused' if paused.exists() else 'yielding_to_we' if ui_active else 'active'
+                if child and child.poll() is not None:
+                    data = read_status(directory)
+                    exit_code = child.returncode
+                    child = None
+                    release_at = None
+                    next_status = 0
+                    if data.get('state') in ('error', 'steam_closed'):
+                        final_state = data['state']
+                        message = data.get('message', '')
+                        break
+                    if exit_code:
+                        raise RuntimeError(f'Steam worker exited with code {exit_code}. See workshop_guard.log.')
+                if child:
+                    if state != 'active' and release_at is None:
+                        session_stop.touch()
+                        release_at = current
+                    if release_at is not None and current - release_at >= 10:
+                        child.terminate()
+                        child.wait(timeout=5)
+                        child = None
+                        release_at = None
+                        next_status = 0
+                elif state == 'active':
+                    session_stop.unlink(missing_ok=True)
+                    child = subprocess.Popen(
+                        background_command(args.install_dir, directory, args.instance, args.sequential, action='session'),
+                        cwd=ROOT, stdin=subprocess.DEVNULL, creationflags=subprocess.CREATE_NO_WINDOW,
+                    )
+                elif current >= next_status:
+                    data = read_status(directory)
+                    write_status(args, state, steam_session=False, we_ui_active=ui_active,
+                                 mode='sequential' if args.sequential else 'session_only',
+                                 downloads=data.get('downloads'), retry_at=data.get('retry_at', {}))
+                    next_status = current + 1
                 time.sleep(0.1)
         except Exception as error:
             final_state = 'error'
-            write('error', message=str(error))
+            message = str(error)
             raise
         finally:
-            if session:
-                session.close()
-            if final_state != 'error':
-                write(final_state)
+            if child and child.poll() is None:
+                session_stop.touch()
+                try:
+                    child.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    child.terminate()
+                    child.wait(timeout=5)
+            data = read_status(directory)
+            write_status(args, final_state, message=message, steam_session=False,
+                         downloads=data.get('downloads'), retry_at=data.get('retry_at', {}))
 
 
-def background_command(install: Path, state_dir: Path, instance: str, sequential: bool) -> list[str]:
+def background_command(install: Path, state_dir: Path, instance: str, sequential: bool, action: str = 'run') -> list[str]:
     if getattr(sys, 'frozen', False):
-        command = [sys.executable, '--worker', 'we_workshop_guard.py']
+        executable = Path(sys.executable)
+        if executable.stem.lower() == 'weworkshopguard':
+            executable = executable.with_name('WEWorker.exe')
+        command = [str(executable), '--worker', 'we_workshop_guard.py']
     else:
         command = [sys.executable, '-X', 'utf8', str(Path(__file__).resolve())]
-    command.extend(['run', '--install-dir', str(install), '--state-dir', str(state_dir), '--instance', instance])
+    command.extend([action, '--install-dir', str(install), '--state-dir', str(state_dir), '--instance', instance])
     if sequential:
         command.append('--sequential')
     return command
@@ -289,7 +436,7 @@ def background_command(install: Path, state_dir: Path, instance: str, sequential
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('action', choices=['start', 'status', 'stop', 'run'])
+    parser.add_argument('action', choices=['start', 'status', 'pause', 'resume', 'stop', 'run', 'session'])
     parser.add_argument('--install-dir', type=Path)
     parser.add_argument('--state-dir', type=Path, default=ROOT / 'output')
     parser.add_argument('--instance', default='')
@@ -298,7 +445,7 @@ def main():
     if os.name != 'nt':
         parser.error('This utility requires Windows and the Steam client.')
     args.state_dir = args.state_dir.resolve()
-    if args.action in ['start', 'run']:
+    if args.action in ['start', 'run', 'session']:
         if args.install_dir is None:
             config = tomllib.loads((ROOT / 'config.toml').read_text(encoding='utf-8-sig'))
             args.install_dir = Path(config['we_install_dir'])
@@ -308,6 +455,9 @@ def main():
     if args.action == 'run':
         run(args)
         return
+    if args.action == 'session':
+        run_session(args)
+        return
     with session_lock(args.state_dir) as acquired:
         if args.action == 'status' or not acquired:
             data = read_status(args.state_dir)
@@ -316,11 +466,21 @@ def main():
             if args.action == 'stop' and not acquired:
                 (args.state_dir / 'workshop_guard.stop').touch()
                 print('Stop requested. Steam may resume background Workshop scheduling.')
+            elif args.action == 'pause' and not acquired:
+                (args.state_dir / 'workshop_guard.pause').touch()
+                print('Pause requested. The Steam session will be released.')
+            elif args.action in ['start', 'resume'] and not acquired:
+                (args.state_dir / 'workshop_guard.pause').unlink(missing_ok=True)
+                print('Resume requested.')
+            return
+        if args.action in ['pause', 'resume']:
+            print('The Workshop session guard is stopped. Use start to launch it.')
             return
         if args.action == 'stop':
             print('The Workshop session guard is already stopped.')
             return
         (args.state_dir / 'workshop_guard.stop').unlink(missing_ok=True)
+        (args.state_dir / 'workshop_guard.pause').unlink(missing_ok=True)
         args.instance = uuid.uuid4().hex
     with (args.state_dir / 'workshop_guard.log').open('a', encoding='utf-8') as log:
         command = background_command(args.install_dir, args.state_dir, args.instance, args.sequential)

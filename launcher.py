@@ -40,6 +40,13 @@ def main() -> None:
         run()
         return
 
+    if Path(sys.executable).stem.lower() == 'weworkshopguard' or '--workshop-tray' in sys.argv:
+        if '--workshop-tray' in sys.argv:
+            sys.argv.remove('--workshop-tray')
+        from we_workshop_tray import main as run
+        run()
+        return
+
     from we_ui import main as run
     run()
 

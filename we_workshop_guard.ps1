@@ -1,5 +1,5 @@
 param(
-    [ValidateSet('Start', 'Status', 'Stop')]
+    [ValidateSet('Start', 'Status', 'Pause', 'Resume', 'Stop')]
     [string]$Action = 'Status',
     [string]$InstallDir = ''
 )

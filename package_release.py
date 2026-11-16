@@ -13,7 +13,7 @@ import tomllib
 
 
 ROOT_FILES = (
-    "WEVideoTools.exe", "WEWorker.exe", "config.example.toml",
+    "WEVideoTools.exe", "WEWorker.exe", "WEWorkshopGuard.exe", "config.example.toml",
     "wallpaper-engine-video-deduplication.js", "we_archive_bridge.js",
     "we_archive_bridge.ps1", "we_workshop_guard.ps1", "LICENSE",
 )
@@ -77,8 +77,10 @@ def main() -> None:
         "output 保存筛重数据库、结果表和取消订阅重试进度。\n"
         "批量取消订阅需要浏览器登录 Steam，并安装随包的 Tampermonkey 脚本。\n"
         "创意工坊归档识别补丁的安装、重装和还原方法见 README.md。\n\n"
-        "后台逐项下载：在 PowerShell 运行 .\\we_workshop_guard.ps1 -Action Start。\n"
-        "使用 -Action Status 查看进度，-Action Stop 停止，具体说明见 README.md。\n\n"
+        "后台逐项下载可双击 WEWorkshopGuard.exe 启动，保留同目录的 WEWorker.exe 和 _internal。\n"
+        "右键托盘图标可查看状态、暂停、恢复和退出。暂停会释放 Steam 占用，方便从 Steam 启动 WE。\n"
+        "自动模式在 WE 主界面打开时让出，界面进程结束后自动接管。手动暂停会保持到恢复。\n"
+        "命令行支持 .\\we_workshop_guard.ps1 -Action Start / Status / Pause / Resume / Stop。\n\n"
         "升级时将新版解压到独立目录，再复制自己的 config.toml、output 和 models_cache。\n",
         encoding="utf-8",
     )
