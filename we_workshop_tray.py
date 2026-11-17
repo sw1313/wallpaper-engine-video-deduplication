@@ -77,7 +77,10 @@ class StatusWindow(QWidget):
         form.addRow('当前项目', self.item)
         form.addRow('下载进度', self.bytes)
         form.addRow('本次完成', self.completed)
-        form.addRow('延后重试', self.deferred)
+        form.addRow('等待重试', self.deferred)
+        self.result = QLabel('—')
+        self.result.setWordWrap(True)
+        form.addRow('最近结果', self.result)
         layout.addLayout(form)
         self.progress = QProgressBar()
         self.progress.setRange(0, 1000)
@@ -148,6 +151,8 @@ class GuardTray:
         self.command = None
         self.command_output = None
         self.command_error = ''
+        self.last_status = {}
+        self.status_pending = False
         self.restart_after_stop = False
         self.exit_requested = False
         self.shutdown_sent = False
@@ -189,7 +194,10 @@ class GuardTray:
 
     def backend_status(self):
         with session_lock(self.directory) as acquired:
-            return read_status(self.directory), not acquired
+            data = read_status(self.directory, fallback=self.last_status)
+            self.status_pending = data is self.last_status
+            self.last_status = data
+            return data, not acquired
 
     def launch(self, action):
         if self.command and self.command.poll() is None:
@@ -318,6 +326,8 @@ class GuardTray:
         label = STATE_LABELS.get(state, '等待状态更新')
         self.window.state.setText('正在退出…' if self.exit_requested else label)
         detail = self.command_error or data.get('message', '')
+        if self.status_pending and running:
+            detail = '正在重试读取状态，暂时显示上次结果。'
         if not detail:
             if state == 'paused':
                 detail = '后台请求已暂停，可以从 Steam 启动 WE。点击恢复后继续自动接管。'
@@ -331,7 +341,12 @@ class GuardTray:
         downloaded, total = downloads.get('downloaded_bytes', 0), downloads.get('total_bytes', 0)
         self.window.bytes.setText(f'{format_bytes(downloaded)} / {format_bytes(total)}' if total else '等待下载信息')
         self.window.completed.setText(str(downloads.get('completed', 0)))
-        self.window.deferred.setText(str(downloads.get('deferred', 0)))
+        self.window.deferred.setText(f"{downloads.get('deferred', 0)} 项（失败后等待 5 分钟）")
+        result = downloads.get('last_result') or {}
+        code = result.get('result')
+        descriptions = {1: '下载成功', 3: 'Steam 连接失败（No Connection）', 'request_rejected': 'Steam 未接受下载请求'}
+        description = descriptions.get(code, f'Steam 错误码 {code}')
+        self.window.result.setText(f"{result.get('item_id', '—')} · {description}" if result else '—')
         value = min(1000, int(downloaded / total * 1000)) if total else 0
         self.window.progress.setValue(value)
         self.window.progress.setFormat(f'{value / 10:.1f}%' if total else '—')

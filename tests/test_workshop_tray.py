@@ -1,4 +1,6 @@
 import os
+from contextlib import nullcontext
+import json
 from pathlib import Path
 import tempfile
 from types import SimpleNamespace
@@ -132,6 +134,27 @@ class TrayTests(unittest.TestCase):
         self.app.processEvents()
         self.assertFalse(request.exists())
         self.assertTrue(self.tray.window.isVisible())
+
+    def test_permission_conflict_keeps_last_status_and_recovers(self):
+        path = self.directory / 'workshop_guard.json'
+        data = {'state': 'active', 'protocol': 3, 'downloads': {'completed': 59, 'deferred': 6, 'last_result': {'item_id': '22', 'result': 3}}}
+        path.write_text(json.dumps(data), encoding='utf-8')
+        with patch('we_workshop_tray.session_lock', return_value=nullcontext(False)):
+            self.tray.refresh()
+            self.assertEqual(self.tray.window.completed.text(), '59')
+            with patch('we_workshop_guard.Path.read_text', side_effect=PermissionError('Busy')), \
+                    patch('we_workshop_guard.time.sleep'):
+                self.tray.refresh()
+            self.assertTrue(self.tray.status_pending)
+            self.assertEqual(self.tray.window.completed.text(), '59')
+            self.assertIn('6 项', self.tray.window.deferred.text())
+            self.assertIn('No Connection', self.tray.window.result.text())
+            self.assertIn('正在重试读取状态', self.tray.window.detail.text())
+            data['downloads']['completed'] = 60
+            path.write_text(json.dumps(data), encoding='utf-8')
+            self.tray.refresh()
+            self.assertFalse(self.tray.status_pending)
+            self.assertEqual(self.tray.window.completed.text(), '60')
 
 
 if __name__ == '__main__':

@@ -44,9 +44,14 @@ def session_lock(directory: Path, filename: str = 'workshop_guard.lock'):
             lock.write(b'0')
             lock.flush()
         lock.seek(0)
+        acquired = False
         try:
             msvcrt.locking(lock.fileno(), msvcrt.LK_NBLCK, 1)
         except OSError:
+            pass
+        else:
+            acquired = True
+        if not acquired:
             yield False
             return
         try:
@@ -56,11 +61,19 @@ def session_lock(directory: Path, filename: str = 'workshop_guard.lock'):
             msvcrt.locking(lock.fileno(), msvcrt.LK_UNLCK, 1)
 
 
-def read_status(directory: Path) -> dict:
-    try:
-        return json.loads((directory / 'workshop_guard.json').read_text(encoding='utf-8'))
-    except (FileNotFoundError, json.JSONDecodeError):
-        return {}
+def read_status(directory: Path, fallback: dict | None = None) -> dict:
+    for attempt in range(5):
+        try:
+            data = json.loads((directory / 'workshop_guard.json').read_text(encoding='utf-8'))
+            if isinstance(data, dict):
+                return data
+            break
+        except PermissionError:
+            if attempt < 4:
+                time.sleep(0.01)
+        except (FileNotFoundError, json.JSONDecodeError, UnicodeError):
+            break
+    return fallback if fallback is not None else {}
 
 
 def steam_directory() -> Path:
@@ -269,21 +282,24 @@ def write_status(args, state, **fields):
     data = dict(state=state, pid=os.getpid(), instance=args.instance, protocol=3,
                 app_id=APP_ID, time=datetime.now().isoformat(timespec='seconds'), **fields)
     temporary = args.state_dir / f'workshop_guard.{os.getpid()}.tmp'
-    temporary.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding='utf-8')
+    text = json.dumps(data, ensure_ascii=False, indent=2)
     for attempt in range(5):
         try:
+            temporary.write_text(text, encoding='utf-8')
             os.replace(temporary, args.state_dir / 'workshop_guard.json')
-            return
+            return True
         except PermissionError:
-            if attempt == 4:
-                raise
-            time.sleep(0.02)
+            if attempt < 4:
+                time.sleep(0.02)
+    # A busy status file must not interrupt Steam callbacks or the download queue.
+    return False
 
 
 def run_session(args):
     """Own the Steam API in an expendable process so pause releases Steam's running state."""
     directory = args.state_dir
     previous = read_status(directory)
+    previous = previous if previous.get('instance') == args.instance else {}
     session = None
     queue = None
     final_state = 'releasing'
@@ -355,8 +371,11 @@ def run(args):
         child = None
         final_state = 'stopped'
         message = ''
+        previous = read_status(directory)
+        previous = previous if previous.get('instance') == args.instance else {}
         write_status(args, 'starting', steam_session=False,
-                     mode='sequential' if args.sequential else 'session_only')
+                     mode='sequential' if args.sequential else 'session_only',
+                     downloads=previous.get('downloads'), retry_at=previous.get('retry_at', {}))
         next_ui_check = 0
         next_status = 0
         ui_active = False

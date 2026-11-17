@@ -12,7 +12,7 @@ Wallpaper Engine 创意工坊视频筛重 + 批量取消订阅 + **已下架物�
 
 ### Windows 便携版
 
-下载 1.1.3 Release 中全部 `WEVideoTools-1.1.3-windows-x64.7z.*` 分卷，放在同一目录，用 7-Zip 打开 `.7z.001` 并解压。启动解压目录中的 `WEVideoTools.exe`。发布文件附有 SHA-256 校验表。[下载 Release](https://github.com/sw1313/wallpaper-engine-video-deduplication/releases/latest)
+下载 1.1.4 Release 中全部 `WEVideoTools-1.1.4-windows-x64.7z.*` 分卷，放在同一目录，用 7-Zip 打开 `.7z.001` 并解压。启动解压目录中的 `WEVideoTools.exe`。发布文件附有 SHA-256 校验表。[下载 Release](https://github.com/sw1313/wallpaper-engine-video-deduplication/releases/latest)
 
 便携版支持 Windows 10 / 11 x64，包含 Python 3.13、Qt 6 与基础查重依赖。启动时会检查 ffmpeg、ffprobe 和可选的 fpcalc。请自行安装工具并加入 PATH，也可在界面填写对应程序的完整路径。
 
@@ -22,7 +22,13 @@ Wallpaper Engine 创意工坊视频筛重 + 批量取消订阅 + **已下架物�
 
 首次启动请填写创意工坊目录与 WE 安装目录。Steam API Key 可在「下架归档」页填写。配置模板使用通用示例路径，输出目录 `output` 和模型缓存目录 `models_cache` 均相对于程序所在目录解析。
 
-升级时将新版解压到独立目录，再复制自己的 `config.toml`、`output/`、`models_cache/` 和已安装的 `runtime/`。保留 `output/unsub_progress.sqlite3` 可继续之前的取消订阅任务，保留 `output/we_dedup_cache.sqlite3` 可复用已计算的签名。将 Tampermonkey 脚本更新到随包的 **20.2.0**。
+升级前从托盘退出后台下载工具，再将新版解压到独立目录，复制自己的 `config.toml`、`output/`、`models_cache/` 和已安装的 `runtime/`。保留 `output/unsub_progress.sqlite3` 可继续之前的取消订阅任务，保留 `output/we_dedup_cache.sqlite3` 可复用已计算的签名。将 Tampermonkey 脚本更新到随包的 **20.2.0**。
+
+### 1.1.4 更新内容
+
+- 修复状态文件短暂被占用时的访问异常，读取失败会保留上次有效状态并自动重试。
+- 状态文件写入遇到临时占用时跳过本次更新，随后继续刷新下载状态。
+- 等待重试数量明确显示项目单位，并显示最近下载结果与 Steam 连接失败原因。
 
 ### 1.1.3 更新内容
 

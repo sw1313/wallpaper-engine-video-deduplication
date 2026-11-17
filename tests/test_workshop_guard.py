@@ -8,6 +8,60 @@ from unittest.mock import patch
 from we_workshop_guard import DownloadQueue, background_command, read_status, run, run_session, write_status
 
 
+class StatusFileTests(unittest.TestCase):
+    @unittest.skipUnless(sys.platform == 'win32', 'Windows file sharing behavior')
+    def test_native_exclusive_lock_is_tolerated_until_access_returns(self):
+        import _winapi
+
+        with tempfile.TemporaryDirectory() as temp:
+            directory = Path(temp)
+            args = SimpleNamespace(state_dir=directory, instance='test')
+            write_status(args, 'active', downloads={'completed': 59})
+            fallback = read_status(directory)
+            handle = _winapi.CreateFile(str(directory / 'workshop_guard.json'), 0x80000000, 0, 0, 3, 0, 0)
+            try:
+                self.assertIs(read_status(directory, fallback), fallback)
+                self.assertFalse(write_status(args, 'active', downloads={'completed': 60}))
+            finally:
+                _winapi.CloseHandle(handle)
+            self.assertTrue(write_status(args, 'active', downloads={'completed': 60}))
+            self.assertEqual(read_status(directory)['downloads']['completed'], 60)
+
+    def test_busy_status_write_keeps_previous_data_and_next_write_recovers(self):
+        with tempfile.TemporaryDirectory() as temp:
+            directory = Path(temp)
+            args = SimpleNamespace(state_dir=directory, instance='test')
+            write_status(args, 'active', downloads={'completed': 1})
+            with patch('we_workshop_guard.os.replace', side_effect=PermissionError('Busy')), \
+                    patch('we_workshop_guard.time.sleep'):
+                self.assertFalse(write_status(args, 'active', downloads={'completed': 2}))
+            self.assertEqual(read_status(directory)['downloads']['completed'], 1)
+            self.assertTrue(write_status(args, 'active', downloads={'completed': 2}))
+            self.assertEqual(read_status(directory)['downloads']['completed'], 2)
+
+    def test_permission_conflict_is_retried_before_returning_fresh_status(self):
+        with tempfile.TemporaryDirectory() as temp:
+            directory = Path(temp)
+            (directory / 'workshop_guard.json').write_text('{"state":"active"}', encoding='utf-8')
+            with patch('we_workshop_guard.Path.read_text', side_effect=[PermissionError('Busy'), PermissionError('Busy'), '{"state":"active"}']) as read, \
+                    patch('we_workshop_guard.time.sleep'):
+                self.assertEqual(read_status(directory), {'state': 'active'})
+            self.assertEqual(read.call_count, 3)
+
+    def test_unavailable_status_preserves_the_callers_last_valid_value(self):
+        fallback = {'state': 'active', 'downloads': {'completed': 59}}
+        with patch('we_workshop_guard.Path.read_text', side_effect=PermissionError('Busy')), \
+                patch('we_workshop_guard.time.sleep'):
+            self.assertIs(read_status(Path('output'), fallback), fallback)
+
+    def test_invalid_json_shape_preserves_fallback(self):
+        with tempfile.TemporaryDirectory() as temp:
+            directory = Path(temp)
+            fallback = {'state': 'paused'}
+            (directory / 'workshop_guard.json').write_text('[]', encoding='utf-8')
+            self.assertIs(read_status(directory, fallback), fallback)
+
+
 class FakeSession:
     def __init__(self):
         self.ugc = object()
@@ -126,6 +180,20 @@ class BackgroundCommandTests(unittest.TestCase):
 
 
 class HandoffTests(unittest.TestCase):
+    def test_restarting_same_instance_preserves_paused_counts_and_retries(self):
+        with tempfile.TemporaryDirectory() as temp:
+            directory = Path(temp)
+            args = SimpleNamespace(state_dir=directory, install_dir=directory, instance='test', sequential=True)
+            write_status(args, 'paused', downloads={'completed': 59, 'deferred': 6}, retry_at={'22': 9999})
+            (directory / 'workshop_guard.pause').touch()
+            with patch('we_workshop_guard.we_ui_running', return_value=True), \
+                    patch('we_workshop_guard.subprocess.Popen') as child, \
+                    patch('we_workshop_guard.time.sleep', side_effect=lambda delay: (directory / 'workshop_guard.stop').touch()):
+                run(args)
+            child.assert_not_called()
+            self.assertEqual(read_status(directory)['downloads']['completed'], 59)
+            self.assertEqual(read_status(directory)['retry_at'], {'22': 9999})
+
     def test_pause_releases_session_and_ui_handoff_resumes_after_closing(self):
         with tempfile.TemporaryDirectory() as temp:
             directory = Path(temp)
