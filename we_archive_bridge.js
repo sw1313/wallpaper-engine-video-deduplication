@@ -27,6 +27,8 @@
     let rootScope;
     const downloadUpdates = { received: 0, unchanged: 0 };
     let pageRedrawsAvoided = 0;
+    let authorReturnPage;
+    let pendingAuthorReturn;
 
     function hasNativeTransfer(item) {
         return item && ["pending", "downloading", "error"].includes(item.status);
@@ -294,6 +296,40 @@
         controller = value;
         if (!value || value.weArchiveBridgeAttached) return;
         value.weArchiveBridgeAttached = true;
+        authorReturnPage = undefined;
+        pendingAuthorReturn = undefined;
+        const browseAuthor = value.callbackBrowseAuthor;
+        const clearAuthor = value.callbackClearAuthorFilter;
+        if (typeof browseAuthor === "function" && typeof clearAuthor === "function") {
+            value.callbackBrowseAuthor = function (id) {
+                const previousPage = authorReturnPage;
+                const previousReturn = pendingAuthorReturn;
+                let returnPage = isWorkshop() ? authorReturnPage || pendingAuthorReturn : undefined;
+                if (!returnPage && isWorkshop() && !value.filterAuthor.authorSteamId &&
+                    Number.isInteger(value.pagination.current) && value.pagination.current > 0) {
+                    returnPage = { page: value.pagination.current, pagination: value.pagination };
+                }
+                pendingAuthorReturn = undefined;
+                const result = browseAuthor.apply(this, arguments);
+                if (isWorkshop() && value.filterAuthor.authorSteamId === id) {
+                    authorReturnPage = returnPage;
+                } else {
+                    authorReturnPage = previousPage;
+                    pendingAuthorReturn = previousReturn;
+                }
+                return result;
+            };
+            value.callbackClearAuthorFilter = function () {
+                if (isWorkshop() && value.filterAuthor.authorSteamId && authorReturnPage) {
+                    pendingAuthorReturn = {
+                        page: authorReturnPage.page, pagination: authorReturnPage.pagination,
+                        filter: JSON.stringify(value.filter), preset: value.filterPreset.workshopid
+                    };
+                    authorReturnPage = undefined;
+                }
+                return clearAuthor.apply(this, arguments);
+            };
+        }
         const update = value.updateWallpapers;
         value.updateWallpapers = function (items) {
             const args = Array.from(arguments);
@@ -411,6 +447,8 @@
         value.$watchCollection("queryWallpapers", refresh);
         value.$watch("source", function (source) {
             if (source === "workshop") return;
+            authorReturnPage = undefined;
+            pendingAuthorReturn = undefined;
             pendingSelection += 1;
             if (activeSelection) activeSelection.done.resolve(false);
             activeSelection = undefined;
@@ -418,7 +456,7 @@
     }
 
     const api = {
-        version: "1.0.10",
+        version: "1.0.11",
         getStats: function () {
             return { version: api.version, archives: archives.size, revision: revision,
                 attached: Boolean(controller), source: controller && controller.source,
@@ -452,6 +490,21 @@
                 const original = host[name];
                 host[name] = function (object, method) {
                     const args = Array.from(arguments);
+                    const query = args[2];
+                    if (pendingAuthorReturn && isWorkshop() && object === "browseWallpaperObject" &&
+                        method === "queryWorkshop" && query && !query.totalOnly && !query.callback &&
+                        Object.prototype.hasOwnProperty.call(query, "filterTitle")) {
+                        const saved = pendingAuthorReturn;
+                        pendingAuthorReturn = undefined;
+                        if (!query.itemid && !controller.filterAuthor.authorSteamId &&
+                            controller.pagination === saved.pagination && query.preset === saved.preset &&
+                            JSON.stringify(controller.filter) === saved.filter) {
+                            // The native filter watcher resets the page before building this query.
+                            // Update the same query object used by its response/pagination callback.
+                            query.page = saved.page;
+                            controller.pagination.current = saved.page;
+                        }
+                    }
                     if (isWorkshop() && object === "ui" && method === "subscribeWorkshopItem" && Array.isArray(args[2])) {
                         const allowed = args[2].filter(function (id) { return !protectedArchive(id); });
                         if (allowed.length !== args[2].length) {

@@ -90,6 +90,19 @@ class FakeSession:
 
 
 class DownloadQueueTests(unittest.TestCase):
+    def test_paused_downloads_process_completions_and_wait_before_the_next_request(self):
+        session = FakeSession()
+        queue = DownloadQueue(session)
+        with patch('we_workshop_guard.time.monotonic', return_value=100):
+            queue.tick([])
+            session.states[22] = 5
+            queue.tick([(22, 1)], paused=True)
+            self.assertEqual(queue.completed, 1)
+            self.assertIsNone(queue.active)
+            self.assertEqual(session.requests, [(22, True)])
+            queue.tick([], paused=False)
+            self.assertEqual(session.requests, [(22, True), (33, True)])
+
     def test_one_request_waits_for_success_callback_before_next_item(self):
         session = FakeSession()
         queue = DownloadQueue(session)
@@ -180,6 +193,179 @@ class BackgroundCommandTests(unittest.TestCase):
 
 
 class HandoffTests(unittest.TestCase):
+    def test_yielding_download_control_switches_to_background_without_reconnecting(self):
+        with tempfile.TemporaryDirectory() as temp:
+            directory = Path(temp)
+            args = SimpleNamespace(state_dir=directory, install_dir=directory, instance='test', sequential=True)
+            (directory / 'workshop_guard.yield').touch()
+            (directory / 'workshop_downloads.pause').touch()
+            session = FakeSession()
+            session.initialized = False
+            session.api.SteamAPI_IsSteamRunning = lambda: True
+            suspended, states = [], []
+            clock = [100]
+            session.api.SteamAPI_ISteamUGC_SuspendDownloads = lambda ugc, paused: suspended.append(paused)
+            session.connect = lambda: setattr(session, 'initialized', True)
+            session.callbacks = lambda: []
+            session.close = lambda: setattr(session, 'initialized', False)
+
+            def step(delay):
+                states.append(read_status(directory))
+                clock[0] += 2
+                if len(states) == 1:
+                    self.assertEqual(session.requests, [])
+                    (directory / 'workshop_guard.yield').unlink()
+                elif len(states) == 2:
+                    self.assertEqual(session.requests, [])
+                    (directory / 'workshop_downloads.pause').unlink()
+                else:
+                    (directory / 'workshop_guard_session.stop').touch()
+
+            with patch('we_workshop_guard.SteamSession', return_value=session) as factory, \
+                    patch('we_workshop_guard.time.monotonic', side_effect=lambda: clock[0]), \
+                    patch('we_workshop_guard.time.sleep', side_effect=step):
+                run_session(args)
+            factory.assert_called_once()
+            self.assertEqual([state['state'] for state in states], ['yielding_to_we', 'downloads_paused', 'active'])
+            self.assertTrue(states[0]['download_control_only'])
+            self.assertTrue(states[0]['downloads_paused'])
+            self.assertTrue(all(state['steam_session'] for state in states))
+            self.assertEqual(suspended, [True, False])
+            self.assertEqual(len(session.requests), 1)
+
+    def test_resuming_downloads_while_yielding_releases_control_and_submits_no_items(self):
+        with tempfile.TemporaryDirectory() as temp:
+            directory = Path(temp)
+            args = SimpleNamespace(state_dir=directory, install_dir=directory, instance='test', sequential=True)
+            (directory / 'workshop_guard.yield').touch()
+            (directory / 'workshop_downloads.pause').touch()
+            session = FakeSession()
+            session.initialized = False
+            session.api.SteamAPI_IsSteamRunning = lambda: True
+            suspended = []
+            session.api.SteamAPI_ISteamUGC_SuspendDownloads = lambda ugc, paused: suspended.append(paused)
+            session.connect = lambda: setattr(session, 'initialized', True)
+            session.callbacks = lambda: []
+            session.close = lambda: setattr(session, 'initialized', False)
+            with patch('we_workshop_guard.SteamSession', return_value=session), \
+                    patch('we_workshop_guard.time.sleep', side_effect=lambda delay: (directory / 'workshop_downloads.pause').unlink()):
+                run_session(args)
+            self.assertEqual(session.requests, [])
+            self.assertEqual(suspended, [True, False])
+            self.assertEqual(read_status(directory)['state'], 'yielding_to_we')
+            self.assertFalse(read_status(directory)['steam_session'])
+
+    def test_supervisor_opens_download_control_while_we_owns_the_queue(self):
+        with tempfile.TemporaryDirectory() as temp:
+            directory = Path(temp)
+            args = SimpleNamespace(state_dir=directory, install_dir=directory, instance='test', sequential=True)
+            (directory / 'workshop_downloads.pause').touch()
+            children, states = [], []
+            clock = [100]
+
+            class Child:
+                def __init__(self, *arguments, **keywords):
+                    self.returncode = None
+                    children.append(self)
+                    assert (directory / 'workshop_guard.yield').exists()
+                    write_status(args, 'yielding_to_we', steam_session=True,
+                                 downloads_paused=True, download_control_only=True)
+
+                def poll(self):
+                    if (directory / 'workshop_guard_session.stop').exists():
+                        self.returncode = 0
+                    return self.returncode
+
+                def wait(self, timeout=None):
+                    self.returncode = 0
+
+            def step(delay):
+                data = read_status(directory)
+                states.append(data)
+                clock[0] += 2
+                if len(states) == 1:
+                    (directory / 'workshop_downloads.pause').unlink()
+                elif not data.get('steam_session'):
+                    (directory / 'workshop_guard.stop').touch()
+
+            with patch('we_workshop_guard.subprocess.Popen', Child), \
+                    patch('we_workshop_guard.we_ui_running', return_value=True), \
+                    patch('we_workshop_guard.time.monotonic', side_effect=lambda: clock[0]), \
+                    patch('we_workshop_guard.time.sleep', side_effect=step):
+                run(args)
+            self.assertEqual(len(children), 1)
+            self.assertTrue(states[0]['steam_session'])
+            self.assertFalse(states[-1]['steam_session'])
+
+    def test_download_pause_suspends_steam_without_releasing_the_session(self):
+        with tempfile.TemporaryDirectory() as temp:
+            directory = Path(temp)
+            args = SimpleNamespace(state_dir=directory, install_dir=directory, instance='test', sequential=True)
+            states, suspended = [], []
+            clock = [100]
+
+            class Session(FakeSession):
+                def __init__(self, install):
+                    super().__init__()
+                    self.initialized = False
+                    self.api.SteamAPI_IsSteamRunning = lambda: True
+                    self.api.SteamAPI_ISteamUGC_SuspendDownloads = lambda ugc, paused: suspended.append(paused)
+
+                def connect(self):
+                    self.initialized = True
+
+                def callbacks(self):
+                    return []
+
+                def close(self):
+                    self.initialized = False
+
+            session = Session(directory)
+
+            def step(delay):
+                states.append(read_status(directory))
+                self.assertTrue(session.initialized)
+                clock[0] += 2
+                if len(states) == 1:
+                    (directory / 'workshop_downloads.pause').touch()
+                elif len(states) == 2:
+                    (directory / 'workshop_downloads.pause').unlink()
+                else:
+                    (directory / 'workshop_guard_session.stop').touch()
+
+            with patch('we_workshop_guard.SteamSession', return_value=session), \
+                    patch('we_workshop_guard.time.monotonic', side_effect=lambda: clock[0]), \
+                    patch('we_workshop_guard.time.sleep', side_effect=step):
+                run_session(args)
+            self.assertEqual([state['state'] for state in states], ['active', 'downloads_paused', 'active'])
+            self.assertTrue(all(state['steam_session'] for state in states))
+            self.assertEqual(suspended, [False, True, False])
+            self.assertEqual(len(session.requests), 1)
+            self.assertFalse(session.initialized)
+
+    def test_starting_with_download_pause_never_resumes_or_requests_a_download(self):
+        with tempfile.TemporaryDirectory() as temp:
+            directory = Path(temp)
+            args = SimpleNamespace(state_dir=directory, install_dir=directory, instance='test', sequential=True)
+            (directory / 'workshop_downloads.pause').touch()
+            session = FakeSession()
+            session.initialized = False
+            suspended = []
+            session.api.SteamAPI_IsSteamRunning = lambda: True
+            session.api.SteamAPI_ISteamUGC_SuspendDownloads = lambda ugc, paused: suspended.append(paused)
+
+            def connect():
+                session.initialized = True
+
+            session.connect = connect
+            session.callbacks = lambda: []
+            session.close = lambda: setattr(session, 'initialized', False)
+            with patch('we_workshop_guard.SteamSession', return_value=session), \
+                    patch('we_workshop_guard.time.sleep', side_effect=lambda delay: (directory / 'workshop_guard_session.stop').touch()):
+                run_session(args)
+            self.assertEqual(session.requests, [])
+            self.assertEqual(suspended, [True, False])
+
     def test_restarting_same_instance_preserves_paused_counts_and_retries(self):
         with tempfile.TemporaryDirectory() as temp:
             directory = Path(temp)

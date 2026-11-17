@@ -23,7 +23,8 @@ from we_workshop_guard import ROOT, background_command, read_status, session_loc
 
 STATE_LABELS = {
     'starting': '正在启动', 'waiting_for_steam': '等待 Steam 登录',
-    'active': '后台逐项下载中', 'paused': '已暂停，已释放 Steam 占用',
+    'active': '后台逐项下载中', 'paused': '接管已暂停，已释放 Steam 占用',
+    'downloads_paused': '下载已暂停，后台接管中',
     'yielding_to_we': 'WE 主界面运行中，已自动让出',
     'stopped': '已停止', 'steam_closed': 'Steam 已退出', 'error': '运行出错',
     'releasing': '正在释放 Steam 占用',
@@ -87,14 +88,17 @@ class StatusWindow(QWidget):
         self.progress.setValue(0)
         layout.addWidget(self.progress)
         buttons = QHBoxLayout()
-        self.resume = QPushButton('启动 / 恢复')
+        self.resume = QPushButton('启动 / 恢复接管')
         self.resume.clicked.connect(controller.start)
-        self.pause = QPushButton('暂停')
+        self.pause = QPushButton('暂停接管')
         self.pause.clicked.connect(controller.pause)
+        self.download_pause = QPushButton('暂停下载')
+        self.download_pause.clicked.connect(controller.toggle_downloads)
         close = QPushButton('收起到托盘')
         close.clicked.connect(self.hide)
         buttons.addWidget(self.resume)
         buttons.addWidget(self.pause)
+        buttons.addWidget(self.download_pause)
         buttons.addStretch()
         buttons.addWidget(close)
         layout.addLayout(buttons)
@@ -161,8 +165,9 @@ class GuardTray:
         self.window = StatusWindow(self)
         menu = QMenu()
         menu.addAction('查看运行状态', self.queue_status)
-        self.start_action = menu.addAction('启动 / 恢复', self.start)
-        self.pause_action = menu.addAction('暂停（释放 Steam 占用）', self.pause)
+        self.start_action = menu.addAction('启动 / 恢复接管', self.start)
+        self.pause_action = menu.addAction('暂停接管（释放 Steam 占用）', self.pause)
+        self.download_action = menu.addAction('暂停下载', self.toggle_downloads)
         menu.addSeparator()
         menu.addAction('设置 WE 安装目录…', self.choose_install)
         menu.addAction('查看运行日志', self.queue_log)
@@ -222,7 +227,7 @@ class GuardTray:
             if not self.choose_install():
                 return
         data, running = self.backend_status()
-        if running and (data.get('protocol', 0) < 3 or data.get('mode') == 'session_only'):
+        if running and (data.get('protocol', 0) < 5 or data.get('mode') == 'session_only'):
             self.restart_after_stop = True
             self.launch('stop')
         else:
@@ -230,6 +235,10 @@ class GuardTray:
 
     def pause(self):
         self.launch('pause')
+
+    def toggle_downloads(self):
+        action = 'resume-downloads' if (self.directory / 'workshop_downloads.pause').exists() else 'pause-downloads'
+        self.launch(action)
 
     def request_stop(self):
         (self.directory / 'workshop_guard.stop').touch()
@@ -324,13 +333,19 @@ class GuardTray:
         if not running and state not in ('error', 'steam_closed'):
             state = 'stopped'
         label = STATE_LABELS.get(state, '等待状态更新')
+        if data.get('download_control_only') and data.get('downloads_paused'):
+            label = '已让出接管，下载已暂停'
         self.window.state.setText('正在退出…' if self.exit_requested else label)
         detail = self.command_error or data.get('message', '')
+        if not detail and data.get('download_control_only'):
+            detail = 'WE 主界面负责浏览与队列调度，工具仅保持 Steam 下载暂停控制。点击恢复下载后释放控制会话。'
         if self.status_pending and running:
             detail = '正在重试读取状态，暂时显示上次结果。'
         if not detail:
             if state == 'paused':
-                detail = '后台请求已暂停，可以从 Steam 启动 WE。点击恢复后继续自动接管。'
+                detail = '后台接管已暂停，可以从 Steam 启动 WE。点击恢复接管后继续。'
+            elif state == 'downloads_paused':
+                detail = 'Steam 创意工坊下载已暂停，后台继续保持接管。点击恢复下载后继续传输。'
             elif state == 'yielding_to_we':
                 detail = '下载由 WE 主界面处理。主界面关闭后，后台工具会自动接管。'
             else:
@@ -354,6 +369,14 @@ class GuardTray:
         self.pause_action.setEnabled(running and state != 'paused' and not busy and not self.exit_requested)
         self.window.resume.setEnabled(self.start_action.isEnabled())
         self.window.pause.setEnabled(self.pause_action.isEnabled())
+        download_text = '恢复下载' if (self.directory / 'workshop_downloads.pause').exists() else '暂停下载'
+        self.download_action.setText(download_text)
+        self.download_action.setEnabled(running and (state in ('active', 'downloads_paused', 'yielding_to_we') or
+                                                     bool(data.get('we_ui_active'))) and
+                                        data.get('protocol', 0) >= 5 and not busy and not self.exit_requested)
+        self.window.download_pause.setText(download_text)
+        self.window.download_pause.setEnabled(self.download_action.isEnabled())
+        self.window.download_pause.setToolTip('支持后台接管或 WE 主界面运行时暂停、恢复创意工坊下载。')
         self.tray.setToolTip(f'WE 后台下载\n{label}')
 
 

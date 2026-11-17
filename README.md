@@ -12,7 +12,7 @@ Wallpaper Engine 创意工坊视频筛重 + 批量取消订阅 + **已下架物�
 
 ### Windows 便携版
 
-下载 1.1.4 Release 中全部 `WEVideoTools-1.1.4-windows-x64.7z.*` 分卷，放在同一目录，用 7-Zip 打开 `.7z.001` 并解压。启动解压目录中的 `WEVideoTools.exe`。发布文件附有 SHA-256 校验表。[下载 Release](https://github.com/sw1313/wallpaper-engine-video-deduplication/releases/latest)
+下载 1.1.5 Release 中全部 `WEVideoTools-1.1.5-windows-x64.7z.*` 分卷，放在同一目录，用 7-Zip 打开 `.7z.001` 并解压。启动解压目录中的 `WEVideoTools.exe`。发布文件附有 SHA-256 校验表。[下载 Release](https://github.com/sw1313/wallpaper-engine-video-deduplication/releases/latest)
 
 便携版支持 Windows 10 / 11 x64，包含 Python 3.13、Qt 6 与基础查重依赖。启动时会检查 ffmpeg、ffprobe 和可选的 fpcalc。请自行安装工具并加入 PATH，也可在界面填写对应程序的完整路径。
 
@@ -23,6 +23,12 @@ Wallpaper Engine 创意工坊视频筛重 + 批量取消订阅 + **已下架物�
 首次启动请填写创意工坊目录与 WE 安装目录。Steam API Key 可在「下架归档」页填写。配置模板使用通用示例路径，输出目录 `output` 和模型缓存目录 `models_cache` 均相对于程序所在目录解析。
 
 升级前从托盘退出后台下载工具，再将新版解压到独立目录，复制自己的 `config.toml`、`output/`、`models_cache/` 和已安装的 `runtime/`。保留 `output/unsub_progress.sqlite3` 可继续之前的取消订阅任务，保留 `output/we_dedup_cache.sqlite3` 可复用已计算的签名。将 Tampermonkey 脚本更新到随包的 **20.2.0**。
+
+### 1.1.5 更新内容
+
+- 创意工坊进入上传者页面后，点 X 会恢复进入前的页码。
+- 后台工具新增「暂停下载 / 恢复下载」，支持后台接管和 WE 主界面运行期间控制下载传输。
+- 原有暂停按钮更名为「暂停接管」，可释放 Steam 占用。
 
 ### 1.1.4 更新内容
 
@@ -212,6 +218,8 @@ python bulk_unsub_controller.py --xlsx duplicates_xxx.xlsx --batch-size 1 --sing
 
 补丁同时优化「已安装」和「创意工坊」页的大批量下载状态更新，过滤完全相同的排队与下载记录，并减少无关的缩略图重绘。普通未订阅项目的右键菜单与上传者信息可在后台下载期间保持响应，上传者资料的获取时间取决于 Steam 的网络响应。
 
+创意工坊分页浏览时，进入上传者页面后点 X 会恢复进入前的页码。排序、筛选和搜索条件沿用 WE 原生处理。
+
 在脚本所在目录打开 PowerShell，替换示例中的 WE 安装目录后运行。
 
 ```powershell
@@ -235,9 +243,11 @@ python bulk_unsub_controller.py --xlsx duplicates_xxx.xlsx --batch-size 1 --sing
 
 需要 Windows、Steam 客户端以及当前账号拥有的 Wallpaper Engine。便携版双击 `WEWorkshopGuard.exe` 启动，保留同目录的 `WEWorker.exe` 和 `_internal/`。首次运行可选择 WE 安装目录，也会读取主程序保存的配置。
 
-右键托盘图标可查看运行状态、启动或恢复、暂停、设置 WE 安装目录、查看运行日志和退出。状态窗口显示当前项目、字节进度、本次完成数和延后重试数，日志页显示最近 128 KB 的日志并每秒刷新。关闭状态窗口会收起到托盘，重复打开程序会唤出已有实例的状态窗口。
+右键托盘图标可查看运行状态、启动或恢复接管、暂停接管、暂停或恢复下载、设置 WE 安装目录、查看运行日志和退出。状态窗口显示当前项目、字节进度、本次完成数和延后重试数，日志页显示最近 128 KB 的日志并每秒刷新。关闭状态窗口会收起到托盘，重复打开程序会唤出已有实例的状态窗口。
 
-需要从 Steam 启动 WE 时，先选择「暂停（释放 Steam 占用）」，等状态变为「已暂停」。暂停会结束持有 Steam 会话的下载子进程，托盘继续运行。选择「启动 / 恢复」后重新接管。自动模式检测到 WE 主界面时会让出，主界面及其清理进程结束后自动恢复。手动暂停期间会一直保持暂停。
+需要从 Steam 启动 WE 时，先选择「暂停接管（释放 Steam 占用）」，等状态显示接管已暂停。暂停接管会结束持有 Steam 会话的下载子进程，托盘继续运行。选择「启动 / 恢复接管」后重新接管。自动模式检测到 WE 主界面时会让出，主界面及其清理进程结束后自动恢复。手动暂停接管期间会一直保持暂停。
+
+后台接管和 WE 主界面运行期间均可选择「暂停下载」，工具通过 Steam 接口暂停创意工坊下载，选择「恢复下载」后继续传输。让出接管期间使用下载控制会话，WE 继续负责浏览与队列调度，恢复下载后工具会释放该控制会话。WE 主界面关闭后，后台工具会按当前暂停设置继续接管。退出工具会释放下载暂停控制。
 
 命令行也可控制后台工具。先在程序中保存 WE 安装目录，或通过 `-InstallDir` 指定该目录。在程序目录打开 PowerShell 后运行以下命令，便携版和源码版使用相同入口。
 
@@ -251,9 +261,13 @@ python bulk_unsub_controller.py --xlsx duplicates_xxx.xlsx --batch-size 1 --sing
 # 查看运行状态、当前项目、下载字节数和本次成功数量
 .\we_workshop_guard.ps1 -Action Status
 
-# 暂停并释放 Steam 占用，再恢复自动接管
+# 暂停接管并释放 Steam 占用，再恢复自动接管
 .\we_workshop_guard.ps1 -Action Pause
 .\we_workshop_guard.ps1 -Action Resume
+
+# 暂停下载传输，再恢复下载
+.\we_workshop_guard.ps1 -Action PauseDownloads
+.\we_workshop_guard.ps1 -Action ResumeDownloads
 
 # 停止后台工具
 .\we_workshop_guard.ps1 -Action Stop

@@ -112,7 +112,7 @@ if ($Action -eq 'Install') {
         $scriptHash = [BitConverter]::ToString($hasher.ComputeHash($utf8.GetBytes($extensionText))).Replace('-', '').Substring(0, 12)
     } finally { $hasher.Dispose() }
     $tag = '<!-- WE_ARCHIVE_BRIDGE_BEGIN --><script src="scripts/' + $scriptName +
-        '?v=1.0.10&amp;build=' + $scriptHash + '"></script><!-- WE_ARCHIVE_BRIDGE_END -->'
+        '?v=1.0.11&amp;build=' + $scriptHash + '"></script><!-- WE_ARCHIVE_BRIDGE_END -->'
     $newIndex = $cleanIndex.Replace('</head>', ($tag + '</head>'))
     $sameScript = (Test-Path -LiteralPath $extensionPath) -and
         ([System.IO.File]::ReadAllText($extensionPath) -ceq $extensionText)

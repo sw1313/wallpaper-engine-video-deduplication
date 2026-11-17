@@ -78,9 +78,12 @@ def main() -> None:
         "批量取消订阅需要浏览器登录 Steam，并安装随包的 Tampermonkey 脚本。\n"
         "创意工坊归档识别补丁的安装、重装和还原方法见 README.md。\n\n"
         "后台逐项下载可双击 WEWorkshopGuard.exe 启动，保留同目录的 WEWorker.exe 和 _internal。\n"
-        "右键托盘图标可查看状态、暂停、恢复和退出。暂停会释放 Steam 占用，方便从 Steam 启动 WE。\n"
+        "右键托盘图标可查看状态、暂停接管、恢复接管、暂停下载、恢复下载和退出。\n"
+        "暂停接管可释放 Steam 占用，方便从 Steam 启动 WE。暂停下载支持后台接管和 WE 主界面运行期间使用。\n"
+        "让出接管期间使用下载控制会话，恢复下载后释放该会话。\n"
+        "上传者页面返回原页码需安装新版 we_archive_bridge.ps1 补丁，并重新启动 WE 加载脚本。\n"
         "自动模式在 WE 主界面打开时让出，界面进程结束后自动接管。手动暂停会保持到恢复。\n"
-        "命令行支持 .\\we_workshop_guard.ps1 -Action Start / Status / Pause / Resume / Stop。\n\n"
+        "命令行支持 .\\we_workshop_guard.ps1 -Action Start / Status / Pause / Resume / PauseDownloads / ResumeDownloads / Stop。\n\n"
         "升级时将新版解压到独立目录，再复制自己的 config.toml、output 和 models_cache。\n",
         encoding="utf-8",
     )

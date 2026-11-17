@@ -1,5 +1,5 @@
 param(
-    [ValidateSet('Start', 'Status', 'Pause', 'Resume', 'Stop')]
+    [ValidateSet('Start', 'Status', 'Pause', 'Resume', 'PauseDownloads', 'ResumeDownloads', 'Stop')]
     [string]$Action = 'Status',
     [string]$InstallDir = ''
 )
@@ -16,7 +16,11 @@ if (Test-Path -LiteralPath $workerPath) {
     }
     $commandArguments = @('-X', 'utf8', (Join-Path $PSScriptRoot 'we_workshop_guard.py'))
 }
-$commandArguments += $Action.ToLowerInvariant()
+$commandArguments += switch ($Action) {
+    'PauseDownloads' { 'pause-downloads' }
+    'ResumeDownloads' { 'resume-downloads' }
+    default { $Action.ToLowerInvariant() }
+}
 if ($Action -eq 'Start') { $commandArguments += '--sequential' }
 if ($InstallDir) { $commandArguments += @('--install-dir', $InstallDir) }
 & $commandPath @commandArguments

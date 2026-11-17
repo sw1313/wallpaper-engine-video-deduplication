@@ -64,10 +64,44 @@ class TrayTests(unittest.TestCase):
         self.assertIn('--sequential', started)
 
     def test_existing_paused_backend_is_resumed_without_starting_another_instance(self):
-        with patch.object(self.tray, 'backend_status', return_value=({'state': 'paused', 'protocol': 3}, True)), \
+        with patch.object(self.tray, 'backend_status', return_value=({'state': 'paused', 'protocol': 5}, True)), \
                 patch.object(self.tray, 'launch') as launch:
             self.tray.start()
         launch.assert_called_once_with('resume')
+
+    def test_download_pause_has_separate_controls_from_handoff_pause(self):
+        (self.directory / 'workshop_downloads.pause').touch()
+        with patch.object(self.tray, 'backend_status', return_value=({'state': 'downloads_paused', 'protocol': 5}, True)):
+            self.tray.refresh()
+        self.assertEqual(self.tray.window.pause.text(), '暂停接管')
+        self.assertEqual(self.tray.window.download_pause.text(), '恢复下载')
+        self.assertTrue(self.tray.window.download_pause.isEnabled())
+        self.assertIn('后台接管中', self.tray.window.state.text())
+        with patch.object(self.tray, 'launch') as launch:
+            self.tray.window.download_pause.click()
+            launch.assert_called_once_with('resume-downloads')
+            launch.reset_mock()
+            self.tray.window.pause.click()
+            launch.assert_called_once_with('pause')
+            launch.reset_mock()
+            (self.directory / 'workshop_downloads.pause').unlink()
+            self.tray.toggle_downloads()
+            launch.assert_called_once_with('pause-downloads')
+
+    def test_download_controls_work_while_yielding_to_we(self):
+        self.tray.status_pending = False
+        with patch.object(self.tray, 'backend_status', return_value=({'state': 'yielding_to_we', 'protocol': 5}, True)):
+            self.tray.refresh()
+        self.assertTrue(self.tray.window.download_pause.isEnabled())
+        with patch.object(self.tray, 'launch') as launch:
+            self.tray.window.download_pause.click()
+            launch.assert_called_once_with('pause-downloads')
+        state = {'state': 'yielding_to_we', 'protocol': 5, 'we_ui_active': True,
+                 'download_control_only': True, 'downloads_paused': True}
+        with patch.object(self.tray, 'backend_status', return_value=(state, True)):
+            self.tray.refresh()
+        self.assertIn('已让出接管，下载已暂停', self.tray.window.state.text())
+        self.assertIn('仅保持 Steam 下载暂停控制', self.tray.window.detail.text())
 
     def test_command_output_is_drained_without_a_blocking_pipe(self):
         with patch('we_workshop_tray.subprocess.Popen') as launch:

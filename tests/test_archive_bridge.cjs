@@ -87,7 +87,8 @@ function setup(options = {}) {
             if (applyAndClose && this.currentSelection?.status === 'installed') {
                 return host.callDeferred('browseWallpaperObject', 'acceptAndClose');
             }
-        }
+        },
+        ...options.controller
     };
     window.browseWallpapersCtrl = ctrl;
     return { window, api, ctrl, host, sizes, calls, messages, selected, updates, progressEvents,
@@ -97,6 +98,162 @@ function setup(options = {}) {
         },
         setResponse: value => { response = value; }, getTemplate: () => patchedTemplate };
 }
+
+function setupAuthorNavigation() {
+    let env;
+    let filterChanged = false;
+    let token = 0;
+    const controller = {
+        pagination: { current: 7, count: 20 },
+        filter: { sort: 'subscriptions', text: '风景', filterTitle: true,
+            tags: { Anime: false }, typetags: { Video: true, Scene: false } },
+        filterPreset: {},
+        filterAuthor: {},
+        steamAvailable: true,
+        callbackBrowseAuthor(id) {
+            if (!this.steamAvailable) return 'offline';
+            env.setSource('workshop');
+            this.filterAuthor.sort = 'published_desc';
+            this.filterAuthor.authorSteamId = id;
+            this.pagination.current = 1;
+            filterChanged = true;
+        },
+        callbackClearAuthorFilter() {
+            delete this.filterAuthor.authorSteamId;
+            filterChanged = true;
+        }
+    };
+    env = setup({ controller });
+    env.flushFilter = async function (pagecount = 20) {
+        assert.ok(filterChanged);
+        filterChanged = false;
+        const ctrl = env.ctrl;
+        // WE's deferred filter watcher resets the page before constructing the query.
+        ctrl.pagination.current = 1;
+        const query = {
+            sort: ctrl.filterAuthor.authorSteamId ? ctrl.filterAuthor.sort : ctrl.filter.sort,
+            text: ctrl.filter.text, filterTitle: ctrl.filter.filterTitle,
+            requiredTags: [], excludedTags: ['Anime', 'Scene'],
+            preset: ctrl.filterPreset.workshopid, itemid: ctrl.filterAuthor.authorSteamId,
+            page: ctrl.pagination.current, token: ++token
+        };
+        env.setResponse({ wallpapers: [], pagecount, token: query.token });
+        const result = await env.host.callDeferred('browseWallpaperObject', 'queryWorkshop', query);
+        ctrl.pagination.count = result.pagecount;
+        ctrl.pagination.current = Math.min(query.page, result.pagecount);
+        return query;
+    };
+    return env;
+}
+
+test('closing the author filter restores the original Workshop page after the native watcher reset', async () => {
+    const env = setupAuthorNavigation();
+    const filter = env.ctrl.filter;
+    const expectedFilter = JSON.parse(JSON.stringify(filter));
+    env.ctrl.callbackBrowseAuthor('author-a');
+    const authorQuery = await env.flushFilter(2);
+    assert.equal(authorQuery.page, 1);
+    env.ctrl.pagination.current = 2;
+    env.ctrl.callbackClearAuthorFilter();
+    const query = await env.flushFilter(20);
+    assert.equal(query.page, 7);
+    assert.equal(env.ctrl.pagination.current, 7);
+    assert.equal(query.itemid, undefined);
+    assert.equal(query.sort, expectedFilter.sort);
+    assert.equal(query.text, expectedFilter.text);
+    assert.deepEqual(query.excludedTags, ['Anime', 'Scene']);
+    assert.equal(env.ctrl.filter, filter);
+    assert.deepEqual(env.ctrl.filter, expectedFilter);
+    assert.deepEqual(env.calls.filter(call => call.method === 'queryWorkshop').map(call => call.args[0].page), [1, 7]);
+});
+
+test('switching authors keeps the original return page and later visits capture the new page', async () => {
+    const env = setupAuthorNavigation();
+    env.ctrl.callbackBrowseAuthor('author-a');
+    await env.flushFilter();
+    env.ctrl.pagination.current = 3;
+    env.ctrl.callbackBrowseAuthor('author-b');
+    await env.flushFilter();
+    env.ctrl.callbackClearAuthorFilter();
+    assert.equal((await env.flushFilter()).page, 7);
+    env.ctrl.pagination.current = 12;
+    env.ctrl.callbackBrowseAuthor('author-c');
+    await env.flushFilter();
+    env.ctrl.callbackClearAuthorFilter();
+    assert.equal((await env.flushFilter()).page, 12);
+});
+
+test('author counts and background queries cannot consume the pending return page', async () => {
+    const env = setupAuthorNavigation();
+    env.ctrl.callbackBrowseAuthor('author-a');
+    await env.flushFilter();
+    env.ctrl.callbackClearAuthorFilter();
+    const count = { totalOnly: true, filterTitle: true, page: 1, itemid: 'author-a' };
+    const background = { category: 'creator', page: 1, itemid: 'author-b' };
+    await env.host.callDeferred('browseWallpaperObject', 'queryWorkshop', count);
+    await env.host.callDeferred('browseWallpaperObject', 'queryWorkshop', background);
+    assert.equal(count.page, 1);
+    assert.equal(background.page, 1);
+    assert.equal((await env.flushFilter()).page, 7);
+});
+
+test('returning consumes the saved page once and later filter changes start on page one', async () => {
+    const env = setupAuthorNavigation();
+    env.ctrl.callbackBrowseAuthor('author-a');
+    await env.flushFilter();
+    env.ctrl.callbackClearAuthorFilter();
+    assert.equal((await env.flushFilter()).page, 7);
+    env.ctrl.filter.text = '新搜索';
+    env.ctrl.callbackClearAuthorFilter();
+    assert.equal((await env.flushFilter()).page, 1);
+});
+
+test('changing search criteria before the return query cancels a stale page restoration', async () => {
+    const env = setupAuthorNavigation();
+    env.ctrl.callbackBrowseAuthor('author-a');
+    await env.flushFilter();
+    env.ctrl.callbackClearAuthorFilter();
+    env.ctrl.filter.text = '新搜索';
+    assert.equal((await env.flushFilter()).page, 1);
+});
+
+test('leaving Workshop or opening an author from Installed uses the native return page', async () => {
+    const env = setupAuthorNavigation();
+    env.ctrl.callbackBrowseAuthor('author-a');
+    await env.flushFilter();
+    env.setSource('installed');
+    env.setSource('workshop');
+    env.ctrl.callbackClearAuthorFilter();
+    assert.equal((await env.flushFilter()).page, 1);
+    env.setSource('installed');
+    env.ctrl.pagination.current = 9;
+    env.ctrl.callbackBrowseAuthor('author-b');
+    await env.flushFilter();
+    env.ctrl.callbackClearAuthorFilter();
+    assert.equal((await env.flushFilter()).page, 1);
+});
+
+test('failed author navigation does not create a return page', async () => {
+    const env = setupAuthorNavigation();
+    env.ctrl.steamAvailable = false;
+    assert.equal(env.ctrl.callbackBrowseAuthor('author-a'), 'offline');
+    assert.equal(env.ctrl.pagination.current, 7);
+    env.ctrl.filterAuthor.authorSteamId = 'externally-opened-author';
+    env.ctrl.callbackClearAuthorFilter();
+    assert.equal((await env.flushFilter()).page, 1);
+});
+
+test('reopening an author before the return query keeps the saved origin page', async () => {
+    const env = setupAuthorNavigation();
+    env.ctrl.callbackBrowseAuthor('author-a');
+    await env.flushFilter();
+    env.ctrl.pagination.current = 2;
+    env.ctrl.callbackClearAuthorFilter();
+    env.ctrl.callbackBrowseAuthor('author-b');
+    await env.flushFilter();
+    env.ctrl.callbackClearAuthorFilter();
+    assert.equal((await env.flushFilter()).page, 7);
+});
 
 function archive(file = archiveFile) {
     return { file, project: file.slice(0, file.lastIndexOf('/') + 1) + 'project.json',

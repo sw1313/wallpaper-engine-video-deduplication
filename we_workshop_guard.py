@@ -231,9 +231,8 @@ class DownloadQueue:
         self.completed = 0
         self.last_result = None
         self.next_request = 0
-        self.session.api.SteamAPI_ISteamUGC_SuspendDownloads(self.session.ugc, False)
 
-    def tick(self, results):
+    def tick(self, results, paused=False):
         current = time.monotonic()
         for item, result in results:
             if item == self.active:
@@ -246,7 +245,7 @@ class DownloadQueue:
                 self.active = None
                 self.refresh_at = 0
                 self.next_request = current if result == 1 else current + 1
-        if self.active is not None:
+        if paused or self.active is not None:
             return
         if current < self.next_request or not self.session.api.SteamAPI_ISteamUser_BLoggedOn(self.session.user):
             return
@@ -279,7 +278,7 @@ class DownloadQueue:
 
 
 def write_status(args, state, **fields):
-    data = dict(state=state, pid=os.getpid(), instance=args.instance, protocol=3,
+    data = dict(state=state, pid=os.getpid(), instance=args.instance, protocol=5,
                 app_id=APP_ID, time=datetime.now().isoformat(timespec='seconds'), **fields)
     temporary = args.state_dir / f'workshop_guard.{os.getpid()}.tmp'
     text = json.dumps(data, ensure_ascii=False, indent=2)
@@ -302,12 +301,16 @@ def run_session(args):
     previous = previous if previous.get('instance') == args.instance else {}
     session = None
     queue = None
+    suspended = None
+    yielding = False
     final_state = 'releasing'
     message = ''
 
     def write(state, **fields):
         write_status(args, state, downloads=queue.status() if queue else previous.get('downloads'),
-                     retry_at=queue.retry_at if queue else previous.get('retry_at', {}), **fields)
+                     retry_at=queue.retry_at if queue else previous.get('retry_at', {}),
+                     downloads_paused=bool(suspended), download_control_only=yielding,
+                     we_ui_active=yielding, **fields)
 
     try:
         session = SteamSession(args.install_dir)
@@ -315,8 +318,15 @@ def run_session(args):
         launched_steam = False
         next_status = 0
         while not any((directory / marker).exists() for marker in (
-                'workshop_guard.stop', 'workshop_guard.pause', 'workshop_guard_session.stop')):
+                'workshop_guard.stop', 'workshop_guard_session.stop')):
             current = time.monotonic()
+            yielding = (directory / 'workshop_guard.yield').exists()
+            pause_downloads = (directory / 'workshop_downloads.pause').exists()
+            if yielding and not pause_downloads:
+                final_state = 'paused' if (directory / 'workshop_guard.pause').exists() else 'yielding_to_we'
+                break
+            if not yielding and (directory / 'workshop_guard.pause').exists():
+                break
             if not session.initialized:
                 error = session.connect()
                 if error is not None:
@@ -338,12 +348,23 @@ def run_session(args):
             if not session.api.SteamAPI_IsSteamRunning():
                 final_state = 'steam_closed'
                 break
+            if pause_downloads != suspended:
+                session.api.SteamAPI_ISteamUGC_SuspendDownloads(session.ugc, pause_downloads)
+                suspended = pause_downloads
+                next_status = 0
             results = session.callbacks()
             if queue:
-                queue.tick(results)
+                queue.tick(results, paused=pause_downloads or yielding)
             if time.monotonic() >= next_status:
-                write('active', logged_on=session.api.SteamAPI_ISteamUser_BLoggedOn(session.user),
-                      steam_session=True, we_ui_active=False,
+                if yielding:
+                    state = 'paused' if (directory / 'workshop_guard.pause').exists() else 'yielding_to_we'
+                elif suspended:
+                    state = 'downloads_paused'
+                else:
+                    state = 'active'
+                write(state,
+                      logged_on=session.api.SteamAPI_ISteamUser_BLoggedOn(session.user),
+                      steam_session=True,
                       mode='sequential' if queue else 'session_only')
                 next_status = time.monotonic() + 1
             time.sleep(0.1)
@@ -355,7 +376,12 @@ def run_session(args):
         if queue:
             queue.active = None
         if session:
-            session.close()
+            try:
+                if suspended and session.initialized and session.api.SteamAPI_IsSteamRunning():
+                    session.api.SteamAPI_ISteamUGC_SuspendDownloads(session.ugc, False)
+                    suspended = False
+            finally:
+                session.close()
         write(final_state, message=message, steam_session=False)
 
 
@@ -365,6 +391,7 @@ def run(args):
     stop = directory / 'workshop_guard.stop'
     paused = directory / 'workshop_guard.pause'
     session_stop = directory / 'workshop_guard_session.stop'
+    yield_control = directory / 'workshop_guard.yield'
     with session_lock(directory) as acquired:
         if not acquired:
             return
@@ -385,8 +412,13 @@ def run(args):
                 current = time.monotonic()
                 if current >= next_ui_check:
                     ui_active = we_ui_running(args.install_dir)
+                    if ui_active:
+                        yield_control.touch()
+                    else:
+                        yield_control.unlink(missing_ok=True)
                     next_ui_check = current + 1
                 state = 'paused' if paused.exists() else 'yielding_to_we' if ui_active else 'active'
+                keep_session = state == 'active' or (ui_active and (directory / 'workshop_downloads.pause').exists())
                 if child and child.poll() is not None:
                     data = read_status(directory)
                     exit_code = child.returncode
@@ -400,7 +432,7 @@ def run(args):
                     if exit_code:
                         raise RuntimeError(f'Steam worker exited with code {exit_code}. See workshop_guard.log.')
                 if child:
-                    if state != 'active' and release_at is None:
+                    if not keep_session and release_at is None:
                         session_stop.touch()
                         release_at = current
                     if release_at is not None and current - release_at >= 10:
@@ -409,7 +441,7 @@ def run(args):
                         child = None
                         release_at = None
                         next_status = 0
-                elif state == 'active':
+                elif keep_session:
                     session_stop.unlink(missing_ok=True)
                     child = subprocess.Popen(
                         background_command(args.install_dir, directory, args.instance, args.sequential, action='session'),
@@ -418,6 +450,7 @@ def run(args):
                 elif current >= next_status:
                     data = read_status(directory)
                     write_status(args, state, steam_session=False, we_ui_active=ui_active,
+                                 downloads_paused=False, download_control_only=False,
                                  mode='sequential' if args.sequential else 'session_only',
                                  downloads=data.get('downloads'), retry_at=data.get('retry_at', {}))
                     next_status = current + 1
@@ -455,7 +488,7 @@ def background_command(install: Path, state_dir: Path, instance: str, sequential
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('action', choices=['start', 'status', 'pause', 'resume', 'stop', 'run', 'session'])
+    parser.add_argument('action', choices=['start', 'status', 'pause', 'resume', 'pause-downloads', 'resume-downloads', 'stop', 'run', 'session'])
     parser.add_argument('--install-dir', type=Path)
     parser.add_argument('--state-dir', type=Path, default=ROOT / 'output')
     parser.add_argument('--instance', default='')
@@ -491,8 +524,14 @@ def main():
             elif args.action in ['start', 'resume'] and not acquired:
                 (args.state_dir / 'workshop_guard.pause').unlink(missing_ok=True)
                 print('Resume requested.')
+            elif args.action == 'pause-downloads' and not acquired:
+                (args.state_dir / 'workshop_downloads.pause').touch()
+                print('Download pause requested. The Steam session stays active while the guard owns downloads.')
+            elif args.action == 'resume-downloads' and not acquired:
+                (args.state_dir / 'workshop_downloads.pause').unlink(missing_ok=True)
+                print('Download resume requested.')
             return
-        if args.action in ['pause', 'resume']:
+        if args.action in ['pause', 'resume', 'pause-downloads', 'resume-downloads']:
             print('The Workshop session guard is stopped. Use start to launch it.')
             return
         if args.action == 'stop':
